@@ -359,11 +359,11 @@ func (s *DockerCLIExecSuite) TestExecInspectID(c *testing.T) {
 	}
 
 	// But we should still be able to query the execID
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+	apiClient, err := client.NewClientWithOpts(client.FromEnv)
 	assert.NilError(c, err)
-	defer cli.Close()
+	defer apiClient.Close()
 
-	_, err = cli.ContainerExecInspect(context.Background(), execID)
+	_, err = apiClient.ContainerExecInspect(context.Background(), execID)
 	assert.NilError(c, err)
 
 	// Now delete the container and then an 'inspect' on the exec should
@@ -371,7 +371,7 @@ func (s *DockerCLIExecSuite) TestExecInspectID(c *testing.T) {
 	out, ec := dockerCmd(c, "rm", "-f", id)
 	assert.Equal(c, ec, 0, "error removing container: %s", out)
 
-	_, err = cli.ContainerExecInspect(context.Background(), execID)
+	_, err = apiClient.ContainerExecInspect(context.Background(), execID)
 	assert.ErrorContains(c, err, "No such exec instance")
 }
 
@@ -509,16 +509,18 @@ func (s *DockerCLIExecSuite) TestExecUlimits(c *testing.T) {
 
 // #15750
 func (s *DockerCLIExecSuite) TestExecStartFails(c *testing.T) {
-	// TODO Windows CI. This test should be portable. Figure out why it fails
-	// currently.
-	testRequires(c, DaemonIsLinux)
 	name := "exec-15750"
 	runSleepingContainer(c, "-d", "--name", name)
 	assert.NilError(c, waitRun(name))
 
 	out, _, err := dockerCmdWithError("exec", name, "no-such-cmd")
 	assert.ErrorContains(c, err, "", out)
-	assert.Assert(c, strings.Contains(out, "executable file not found"))
+
+	expectedMsg := "executable file not found"
+	if DaemonIsWindows() {
+		expectedMsg = "The system cannot find the file specified"
+	}
+	assert.Assert(c, is.Contains(out, expectedMsg))
 }
 
 // Fix regression in https://github.com/docker/docker/pull/26461#issuecomment-250287297
