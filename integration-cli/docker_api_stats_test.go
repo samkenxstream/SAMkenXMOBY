@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/testutil/request"
@@ -40,9 +41,9 @@ func (s *DockerAPISuite) TestAPIStatsNoStreamGetCpu(c *testing.T) {
 	assert.NilError(c, err)
 	body.Close()
 
-	var cpuPercent = 0.0
+	cpuPercent := 0.0
 
-	if testEnv.OSType != "windows" {
+	if testEnv.DaemonInfo.OSType != "windows" {
 		cpuDelta := float64(v.CPUStats.CPUUsage.TotalUsage - v.PreCPUStats.CPUUsage.TotalUsage)
 		systemDelta := float64(v.CPUStats.SystemUsage - v.PreCPUStats.SystemUsage)
 		cpuPercent = (cpuDelta / systemDelta) * float64(len(v.CPUStats.CPUUsage.PercpuUsage)) * 100.0
@@ -71,7 +72,7 @@ func (s *DockerAPISuite) TestAPIStatsStoppedContainerInGoroutines(c *testing.T) 
 	getGoRoutines := func() int {
 		_, body, err := request.Get("/info")
 		assert.NilError(c, err)
-		info := types.Info{}
+		info := system.Info{}
 		err = json.NewDecoder(body).Decode(&info)
 		assert.NilError(c, err)
 		body.Close()
@@ -109,7 +110,7 @@ func (s *DockerAPISuite) TestAPIStatsNetworkStats(c *testing.T) {
 
 	// Retrieve the container address
 	net := "bridge"
-	if testEnv.OSType == "windows" {
+	if testEnv.DaemonInfo.OSType == "windows" {
 		net = "nat"
 	}
 	contIP := findContainerIP(c, id, net)
@@ -157,7 +158,7 @@ func (s *DockerAPISuite) TestAPIStatsNetworkStats(c *testing.T) {
 	// On Linux, account for ARP.
 	expRxPkts := preRxPackets + uint64(numPings)
 	expTxPkts := preTxPackets + uint64(numPings)
-	if testEnv.OSType != "windows" {
+	if testEnv.DaemonInfo.OSType != "windows" {
 		expRxPkts++
 		expTxPkts++
 	}

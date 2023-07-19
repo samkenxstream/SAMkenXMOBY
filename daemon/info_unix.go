@@ -1,26 +1,30 @@
 //go:build !windows
-// +build !windows
 
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/containerd/containerd/log"
+	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/system"
+	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/pkg/rootless"
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	rkclient "github.com/rootless-containers/rootlesskit/pkg/api/client"
 )
 
 // fillPlatformInfo fills the platform related info.
-func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) {
-	v.CgroupDriver = daemon.getCgroupDriver()
+func (daemon *Daemon) fillPlatformInfo(v *system.Info, sysInfo *sysinfo.SysInfo, cfg *configStore) {
+	v.CgroupDriver = cgroupDriver(&cfg.Config)
 	v.CgroupVersion = "1"
 	if sysInfo.CgroupUnified {
 		v.CgroupVersion = "2"
@@ -38,41 +42,44 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 		v.CPUSet = sysInfo.Cpuset
 		v.PidsLimit = sysInfo.PidsLimit
 	}
-	v.Runtimes = daemon.configStore.GetAllRuntimes()
-	v.DefaultRuntime = daemon.configStore.GetDefaultRuntimeName()
+	v.Runtimes = make(map[string]system.Runtime)
+	for n, p := range stockRuntimes() {
+		v.Runtimes[n] = system.Runtime{Path: p}
+	}
+	for n, r := range cfg.Config.Runtimes {
+		v.Runtimes[n] = system.Runtime{
+			Path: r.Path,
+			Args: append([]string(nil), r.Args...),
+		}
+	}
+	v.DefaultRuntime = cfg.Runtimes.Default
 	v.RuncCommit.ID = "N/A"
 	v.ContainerdCommit.ID = "N/A"
 	v.InitCommit.ID = "N/A"
 
-	if rt := daemon.configStore.GetRuntime(v.DefaultRuntime); rt != nil {
-		if rv, err := exec.Command(rt.Path, "--version").Output(); err == nil {
-			if _, _, commit, err := parseRuntimeVersion(string(rv)); err != nil {
-				logrus.Warnf("failed to parse %s version: %v", rt.Path, err)
-			} else {
-				v.RuncCommit.ID = commit
-			}
-		} else {
-			logrus.Warnf("failed to retrieve %s version: %v", rt.Path, err)
-		}
+	if _, _, commit, err := parseDefaultRuntimeVersion(&cfg.Runtimes); err != nil {
+		log.G(context.TODO()).Warnf(err.Error())
+	} else {
+		v.RuncCommit.ID = commit
 	}
 
 	if rv, err := daemon.containerd.Version(context.Background()); err == nil {
 		v.ContainerdCommit.ID = rv.Revision
 	} else {
-		logrus.Warnf("failed to retrieve containerd version: %v", err)
+		log.G(context.TODO()).Warnf("failed to retrieve containerd version: %v", err)
 	}
 
-	v.InitBinary = daemon.configStore.GetInitPath()
-	if initBinary, err := daemon.configStore.LookupInitPath(); err != nil {
-		logrus.Warnf("failed to find docker-init: %s", err)
+	v.InitBinary = cfg.GetInitPath()
+	if initBinary, err := cfg.LookupInitPath(); err != nil {
+		log.G(context.TODO()).Warnf("failed to find docker-init: %s", err)
 	} else if rv, err := exec.Command(initBinary, "--version").Output(); err == nil {
 		if _, commit, err := parseInitVersion(string(rv)); err != nil {
-			logrus.Warnf("failed to parse %s version: %s", initBinary, err)
+			log.G(context.TODO()).Warnf("failed to parse %s version: %s", initBinary, err)
 		} else {
 			v.InitCommit.ID = commit
 		}
 	} else {
-		logrus.Warnf("failed to retrieve %s version: %s", initBinary, err)
+		log.G(context.TODO()).Warnf("failed to retrieve %s version: %s", initBinary, err)
 	}
 
 	// Set expected and actual commits to the same value to prevent the client
@@ -166,7 +173,7 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 	}
 }
 
-func (daemon *Daemon) fillPlatformVersion(v *types.Version) {
+func (daemon *Daemon) fillPlatformVersion(v *types.Version, cfg *configStore) {
 	if rv, err := daemon.containerd.Version(context.Background()); err == nil {
 		v.Components = append(v.Components, types.ComponentVersion{
 			Name:    "containerd",
@@ -177,30 +184,23 @@ func (daemon *Daemon) fillPlatformVersion(v *types.Version) {
 		})
 	}
 
-	defaultRuntime := daemon.configStore.GetDefaultRuntimeName()
-	if rt := daemon.configStore.GetRuntime(defaultRuntime); rt != nil {
-		if rv, err := exec.Command(rt.Path, "--version").Output(); err == nil {
-			if _, ver, commit, err := parseRuntimeVersion(string(rv)); err != nil {
-				logrus.Warnf("failed to parse %s version: %v", rt.Path, err)
-			} else {
-				v.Components = append(v.Components, types.ComponentVersion{
-					Name:    defaultRuntime,
-					Version: ver,
-					Details: map[string]string{
-						"GitCommit": commit,
-					},
-				})
-			}
-		} else {
-			logrus.Warnf("failed to retrieve %s version: %v", rt.Path, err)
-		}
+	if _, ver, commit, err := parseDefaultRuntimeVersion(&cfg.Runtimes); err != nil {
+		log.G(context.TODO()).Warnf(err.Error())
+	} else {
+		v.Components = append(v.Components, types.ComponentVersion{
+			Name:    cfg.Runtimes.Default,
+			Version: ver,
+			Details: map[string]string{
+				"GitCommit": commit,
+			},
+		})
 	}
 
-	if initBinary, err := daemon.configStore.LookupInitPath(); err != nil {
-		logrus.Warnf("failed to find docker-init: %s", err)
+	if initBinary, err := cfg.LookupInitPath(); err != nil {
+		log.G(context.TODO()).Warnf("failed to find docker-init: %s", err)
 	} else if rv, err := exec.Command(initBinary, "--version").Output(); err == nil {
 		if ver, commit, err := parseInitVersion(string(rv)); err != nil {
-			logrus.Warnf("failed to parse %s version: %s", initBinary, err)
+			log.G(context.TODO()).Warnf("failed to parse %s version: %s", initBinary, err)
 		} else {
 			v.Components = append(v.Components, types.ComponentVersion{
 				Name:    filepath.Base(initBinary),
@@ -211,7 +211,7 @@ func (daemon *Daemon) fillPlatformVersion(v *types.Version) {
 			})
 		}
 	} else {
-		logrus.Warnf("failed to retrieve %s version: %s", initBinary, err)
+		log.G(context.TODO()).Warnf("failed to retrieve %s version: %s", initBinary, err)
 	}
 
 	daemon.fillRootlessVersion(v)
@@ -221,14 +221,14 @@ func (daemon *Daemon) fillRootlessVersion(v *types.Version) {
 	if !rootless.RunningWithRootlessKit() {
 		return
 	}
-	rlc, err := rootless.GetRootlessKitClient()
+	rlc, err := getRootlessKitClient()
 	if err != nil {
-		logrus.Warnf("failed to create RootlessKit client: %v", err)
+		log.G(context.TODO()).Warnf("failed to create RootlessKit client: %v", err)
 		return
 	}
 	rlInfo, err := rlc.Info(context.TODO())
 	if err != nil {
-		logrus.Warnf("failed to retrieve RootlessKit version: %v", err)
+		log.G(context.TODO()).Warnf("failed to retrieve RootlessKit version: %v", err)
 		return
 	}
 	v.Components = append(v.Components, types.ComponentVersion{
@@ -246,7 +246,7 @@ func (daemon *Daemon) fillRootlessVersion(v *types.Version) {
 	case "slirp4netns":
 		if rv, err := exec.Command("slirp4netns", "--version").Output(); err == nil {
 			if _, ver, commit, err := parseRuntimeVersion(string(rv)); err != nil {
-				logrus.Warnf("failed to parse slirp4netns version: %v", err)
+				log.G(context.TODO()).Warnf("failed to parse slirp4netns version: %v", err)
 			} else {
 				v.Components = append(v.Components, types.ComponentVersion{
 					Name:    "slirp4netns",
@@ -257,7 +257,7 @@ func (daemon *Daemon) fillRootlessVersion(v *types.Version) {
 				})
 			}
 		} else {
-			logrus.Warnf("failed to retrieve slirp4netns version: %v", err)
+			log.G(context.TODO()).Warnf("failed to retrieve slirp4netns version: %v", err)
 		}
 	case "vpnkit":
 		if rv, err := exec.Command("vpnkit", "--version").Output(); err == nil {
@@ -266,43 +266,33 @@ func (daemon *Daemon) fillRootlessVersion(v *types.Version) {
 				Version: strings.TrimSpace(string(rv)),
 			})
 		} else {
-			logrus.Warnf("failed to retrieve vpnkit version: %v", err)
+			log.G(context.TODO()).Warnf("failed to retrieve vpnkit version: %v", err)
 		}
 	}
 }
 
-func fillDriverWarnings(v *types.Info) {
-	for _, pair := range v.DriverStatus {
-		if pair[0] == "Data loop file" {
-			msg := fmt.Sprintf("WARNING: %s: usage of loopback devices is "+
-				"strongly discouraged for production use.\n         "+
-				"Use `--storage-opt dm.thinpooldev` to specify a custom block storage device.", v.Driver)
-
-			v.Warnings = append(v.Warnings, msg)
-			continue
-		}
-		if pair[0] == "Supports d_type" && pair[1] == "false" {
-			backingFs := getBackingFs(v)
-
-			msg := fmt.Sprintf("WARNING: %s: the backing %s filesystem is formatted without d_type support, which leads to incorrect behavior.\n", v.Driver, backingFs)
-			if backingFs == "xfs" {
-				msg += "         Reformat the filesystem with ftype=1 to enable d_type support.\n"
-			}
-			msg += "         Running without d_type support will not be supported in future releases."
-
-			v.Warnings = append(v.Warnings, msg)
-			continue
-		}
+// getRootlessKitClient returns RootlessKit client
+func getRootlessKitClient() (rkclient.Client, error) {
+	stateDir := os.Getenv("ROOTLESSKIT_STATE_DIR")
+	if stateDir == "" {
+		return nil, errors.New("environment variable `ROOTLESSKIT_STATE_DIR` is not set")
 	}
+	apiSock := filepath.Join(stateDir, "api.sock")
+	return rkclient.New(apiSock)
 }
 
-func getBackingFs(v *types.Info) string {
+func fillDriverWarnings(v *system.Info) {
 	for _, pair := range v.DriverStatus {
-		if pair[0] == "Backing Filesystem" {
-			return pair[1]
+		if pair[0] == "Extended file attributes" && pair[1] == "best-effort" {
+			msg := fmt.Sprintf("WARNING: %s: extended file attributes from container images "+
+				"will be silently discarded if the backing filesystem does not support them.\n"+
+				"         CONTAINERS MAY MALFUNCTION IF EXTENDED ATTRIBUTES ARE MISSING.\n"+
+				"         This is an UNSUPPORTABLE configuration for which no bug reports will be accepted.\n", v.Driver)
+
+			v.Warnings = append(v.Warnings, msg)
+			continue
 		}
 	}
-	return ""
 }
 
 // parseInitVersion parses a Tini version string, and extracts the "version"
@@ -338,7 +328,7 @@ func parseInitVersion(v string) (version string, commit string, err error) {
 //	runc version 1.0.0-rc5+dev
 //	commit: 69663f0bd4b60df09991c08812a60108003fa340
 //	spec: 1.0.0
-func parseRuntimeVersion(v string) (runtime string, version string, commit string, err error) {
+func parseRuntimeVersion(v string) (runtime, version, commit string, err error) {
 	lines := strings.Split(strings.TrimSpace(v), "\n")
 	for _, line := range lines {
 		if strings.Contains(line, "version") {
@@ -358,11 +348,39 @@ func parseRuntimeVersion(v string) (runtime string, version string, commit strin
 	return runtime, version, commit, err
 }
 
-func (daemon *Daemon) cgroupNamespacesEnabled(sysInfo *sysinfo.SysInfo) bool {
-	return sysInfo.CgroupNamespaces && containertypes.CgroupnsMode(daemon.configStore.CgroupNamespaceMode).IsPrivate()
+func parseDefaultRuntimeVersion(rts *runtimes) (runtime, version, commit string, err error) {
+	shim, opts, err := rts.Get(rts.Default)
+	if err != nil {
+		return "", "", "", err
+	}
+	shimopts, ok := opts.(*v2runcoptions.Options)
+	if !ok {
+		return "", "", "", fmt.Errorf("%s: retrieving version not supported", shim)
+	}
+	rt := shimopts.BinaryName
+	if rt == "" {
+		rt = defaultRuntimeName
+	}
+	rv, err := exec.Command(rt, "--version").Output()
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to retrieve %s version: %w", rt, err)
+	}
+	runtime, version, commit, err = parseRuntimeVersion(string(rv))
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to parse %s version: %w", rt, err)
+	}
+	return runtime, version, commit, err
+}
+
+func cgroupNamespacesEnabled(sysInfo *sysinfo.SysInfo, cfg *config.Config) bool {
+	return sysInfo.CgroupNamespaces && containertypes.CgroupnsMode(cfg.CgroupNamespaceMode).IsPrivate()
 }
 
 // Rootless returns true if daemon is running in rootless mode
-func (daemon *Daemon) Rootless() bool {
-	return daemon.configStore.Rootless
+func Rootless(cfg *config.Config) bool {
+	return cfg.Rootless
+}
+
+func noNewPrivileges(cfg *config.Config) bool {
+	return cfg.NoNewPrivileges
 }

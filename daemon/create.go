@@ -8,21 +8,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	imagetypes "github.com/docker/docker/api/types/image"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/runconfig"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	archvariant "github.com/tonistiigi/go-archvariant"
 )
 
@@ -34,7 +35,7 @@ type createOpts struct {
 
 // CreateManagedContainer creates a container that is managed by a Service
 func (daemon *Daemon) CreateManagedContainer(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
-	return daemon.containerCreate(ctx, createOpts{
+	return daemon.containerCreate(ctx, daemon.config(), createOpts{
 		params:  params,
 		managed: true,
 	})
@@ -42,7 +43,7 @@ func (daemon *Daemon) CreateManagedContainer(ctx context.Context, params types.C
 
 // ContainerCreate creates a regular container
 func (daemon *Daemon) ContainerCreate(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
-	return daemon.containerCreate(ctx, createOpts{
+	return daemon.containerCreate(ctx, daemon.config(), createOpts{
 		params: params,
 	})
 }
@@ -50,19 +51,19 @@ func (daemon *Daemon) ContainerCreate(ctx context.Context, params types.Containe
 // ContainerCreateIgnoreImagesArgsEscaped creates a regular container. This is called from the builder RUN case
 // and ensures that we do not take the images ArgsEscaped
 func (daemon *Daemon) ContainerCreateIgnoreImagesArgsEscaped(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
-	return daemon.containerCreate(ctx, createOpts{
+	return daemon.containerCreate(ctx, daemon.config(), createOpts{
 		params:                  params,
 		ignoreImagesArgsEscaped: true,
 	})
 }
 
-func (daemon *Daemon) containerCreate(ctx context.Context, opts createOpts) (containertypes.CreateResponse, error) {
+func (daemon *Daemon) containerCreate(ctx context.Context, daemonCfg *configStore, opts createOpts) (containertypes.CreateResponse, error) {
 	start := time.Now()
 	if opts.params.Config == nil {
 		return containertypes.CreateResponse{}, errdefs.InvalidParameter(errors.New("Config cannot be empty in order to create a container"))
 	}
 
-	warnings, err := daemon.verifyContainerSettings(opts.params.HostConfig, opts.params.Config, false)
+	warnings, err := daemon.verifyContainerSettings(daemonCfg, opts.params.HostConfig, opts.params.Config, false)
 	if err != nil {
 		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
@@ -74,7 +75,7 @@ func (daemon *Daemon) containerCreate(ctx context.Context, opts createOpts) (con
 		}
 		if img != nil {
 			p := maximumSpec()
-			imgPlat := v1.Platform{
+			imgPlat := ocispec.Platform{
 				OS:           img.OS,
 				Architecture: img.Architecture,
 				Variant:      img.Variant,
@@ -94,12 +95,12 @@ func (daemon *Daemon) containerCreate(ctx context.Context, opts createOpts) (con
 	if opts.params.HostConfig == nil {
 		opts.params.HostConfig = &containertypes.HostConfig{}
 	}
-	err = daemon.adaptContainerSettings(opts.params.HostConfig, opts.params.AdjustCPUShares)
+	err = daemon.adaptContainerSettings(&daemonCfg.Config, opts.params.HostConfig, opts.params.AdjustCPUShares)
 	if err != nil {
 		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	ctr, err := daemon.create(ctx, opts)
+	ctr, err := daemon.create(ctx, &daemonCfg.Config, opts)
 	if err != nil {
 		return containertypes.CreateResponse{Warnings: warnings}, err
 	}
@@ -113,11 +114,11 @@ func (daemon *Daemon) containerCreate(ctx context.Context, opts createOpts) (con
 }
 
 // Create creates a new container from the given configuration with a given name.
-func (daemon *Daemon) create(ctx context.Context, opts createOpts) (retC *container.Container, retErr error) {
+func (daemon *Daemon) create(ctx context.Context, daemonCfg *config.Config, opts createOpts) (retC *container.Container, retErr error) {
 	var (
 		ctr         *container.Container
 		img         *image.Image
-		imgManifest *v1.Descriptor
+		imgManifest *ocispec.Descriptor
 		imgID       image.ID
 		err         error
 		os          = runtime.GOOS
@@ -134,7 +135,7 @@ func (daemon *Daemon) create(ctx context.Context, opts createOpts) (retC *contai
 		if daemon.UsesSnapshotter() {
 			imgManifest, err = daemon.imageService.GetImageManifest(ctx, opts.params.Config.Image, imagetypes.GetImageOpts{Platform: opts.params.Platform})
 			if err != nil {
-				logrus.WithError(err).Error("failed to find image manifest")
+				log.G(ctx).WithError(err).Error("failed to find image manifest")
 				return nil, err
 			}
 		}
@@ -170,12 +171,12 @@ func (daemon *Daemon) create(ctx context.Context, opts createOpts) (retC *contai
 				RemoveVolume: true,
 			})
 			if err != nil {
-				logrus.WithError(err).Error("failed to cleanup container on create error")
+				log.G(ctx).WithError(err).Error("failed to cleanup container on create error")
 			}
 		}
 	}()
 
-	if err := daemon.setSecurityOptions(ctr, opts.params.HostConfig); err != nil {
+	if err := daemon.setSecurityOptions(daemonCfg, ctr, opts.params.HostConfig); err != nil {
 		return nil, err
 	}
 
@@ -196,10 +197,10 @@ func (daemon *Daemon) create(ctx context.Context, opts createOpts) (retC *contai
 	}
 
 	current := idtools.CurrentIdentity()
-	if err := idtools.MkdirAndChown(ctr.Root, 0710, idtools.Identity{UID: current.UID, GID: daemon.IdentityMapping().RootPair().GID}); err != nil {
+	if err := idtools.MkdirAndChown(ctr.Root, 0o710, idtools.Identity{UID: current.UID, GID: daemon.IdentityMapping().RootPair().GID}); err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAndChown(ctr.CheckpointDir(), 0700, current); err != nil {
+	if err := idtools.MkdirAndChown(ctr.CheckpointDir(), 0o700, current); err != nil {
 		return nil, err
 	}
 
@@ -345,7 +346,7 @@ func verifyNetworkingConfig(nwConfig *networktypes.NetworkingConfig) error {
 }
 
 // maximumSpec returns the distribution platform with maximum compatibility for the current node.
-func maximumSpec() v1.Platform {
+func maximumSpec() ocispec.Platform {
 	p := platforms.DefaultSpec()
 	if p.Architecture == "amd64" {
 		p.Variant = archvariant.AMD64Variant()

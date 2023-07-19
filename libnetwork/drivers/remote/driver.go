@@ -1,9 +1,11 @@
 package remote
 
 import (
+	"context"
 	"fmt"
 	"net"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/discoverapi"
 	"github.com/docker/docker/libnetwork/driverapi"
@@ -12,7 +14,6 @@ import (
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 type driver struct {
@@ -28,14 +29,6 @@ func newDriver(name string, client *plugins.Client) driverapi.Driver {
 	return &driver{networkType: name, endpoint: client}
 }
 
-// Init makes sure a remote driver is registered when a network driver
-// plugin is activated.
-//
-// Deprecated: use [Register].
-func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
-	return Register(dc, dc.GetPluginGetter())
-}
-
 // Register makes sure a remote driver is registered with r when a network
 // driver plugin is activated.
 func Register(r driverapi.Registerer, pg plugingetter.PluginGetter) error {
@@ -44,11 +37,11 @@ func Register(r driverapi.Registerer, pg plugingetter.PluginGetter) error {
 		d := newDriver(name, client)
 		c, err := d.(*driver).getCapabilities()
 		if err != nil {
-			logrus.Errorf("error getting capability for %s due to %v", name, err)
+			log.G(context.TODO()).Errorf("error getting capability for %s due to %v", name, err)
 			return
 		}
 		if err = r.RegisterDriver(name, d, *c); err != nil {
-			logrus.Errorf("error registering driver for %s due to %v", name, err)
+			log.G(context.TODO()).Errorf("error registering driver for %s due to %v", name, err)
 		}
 	}
 
@@ -245,11 +238,11 @@ func errorWithRollback(msg string, err error) error {
 }
 
 func (d *driver) DeleteEndpoint(nid, eid string) error {
-	delete := &api.DeleteEndpointRequest{
+	deleteRequest := &api.DeleteEndpointRequest{
 		NetworkID:  nid,
 		EndpointID: eid,
 	}
-	return d.call("DeleteEndpoint", delete, &api.DeleteEndpointResponse{})
+	return d.call("DeleteEndpoint", deleteRequest, &api.DeleteEndpointResponse{})
 }
 
 func (d *driver) EndpointOperInfo(nid, eid string) (map[string]interface{}, error) {
@@ -392,7 +385,7 @@ func (d *driver) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{
 }
 
 func parseStaticRoutes(r api.JoinResponse) ([]*types.StaticRoute, error) {
-	var routes = make([]*types.StaticRoute, len(r.StaticRoutes))
+	routes := make([]*types.StaticRoute, len(r.StaticRoutes))
 	for i, inRoute := range r.StaticRoutes {
 		var err error
 		outRoute := &types.StaticRoute{RouteType: inRoute.RouteType}

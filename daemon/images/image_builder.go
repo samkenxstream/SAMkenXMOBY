@@ -5,6 +5,7 @@ import (
 	"io"
 	"runtime"
 
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types/backend"
@@ -19,15 +20,19 @@ import (
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/pkg/system"
 	registrypkg "github.com/docker/docker/registry"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 type roLayer struct {
 	released   bool
 	layerStore layer.Store
 	roLayer    layer.Layer
+}
+
+func (l *roLayer) ContentStoreDigest() digest.Digest {
+	return ""
 }
 
 func (l *roLayer) DiffID() layer.DiffID {
@@ -144,7 +149,7 @@ func newROLayerForImage(img *image.Image, layerStore layer.Store) (builder.ROLay
 }
 
 // TODO: could this use the regular daemon PullImage ?
-func (i *ImageService) pullForBuilder(ctx context.Context, name string, authConfigs map[string]registry.AuthConfig, output io.Writer, platform *specs.Platform) (*image.Image, error) {
+func (i *ImageService) pullForBuilder(ctx context.Context, name string, authConfigs map[string]registry.AuthConfig, output io.Writer, platform *ocispec.Platform) (*image.Image, error) {
 	ref, err := reference.ParseNormalizedNamed(name)
 	if err != nil {
 		return nil, err
@@ -169,7 +174,7 @@ func (i *ImageService) pullForBuilder(ctx context.Context, name string, authConf
 
 	img, err := i.GetImage(ctx, name, imagetypes.GetImageOpts{Platform: platform})
 	if errdefs.IsNotFound(err) && img != nil && platform != nil {
-		imgPlat := specs.Platform{
+		imgPlat := ocispec.Platform{
 			OS:           img.OS,
 			Architecture: img.BaseImgArch(),
 			Variant:      img.BaseImgVariant(),
@@ -184,7 +189,7 @@ This is most likely caused by a bug in the build system that created the fetched
 Please notify the image author to correct the configuration.`,
 				platforms.Format(p), platforms.Format(imgPlat), name,
 			)
-			logrus.WithError(err).WithField("image", name).Warn("Ignoring error about platform mismatch where the manifest list points to an image whose configuration does not match the platform in the manifest.")
+			log.G(ctx).WithError(err).WithField("image", name).Warn("Ignoring error about platform mismatch where the manifest list points to an image whose configuration does not match the platform in the manifest.")
 			err = nil
 		}
 	}
@@ -241,7 +246,7 @@ func (i *ImageService) GetImageAndReleasableLayer(ctx context.Context, refOrID s
 // CreateImage creates a new image by adding a config and ID to the image store.
 // This is similar to LoadImage() except that it receives JSON encoded bytes of
 // an image instead of a tar archive.
-func (i *ImageService) CreateImage(config []byte, parent string) (builder.Image, error) {
+func (i *ImageService) CreateImage(ctx context.Context, config []byte, parent string, _ digest.Digest) (builder.Image, error) {
 	id, err := i.imageStore.Create(config)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to create image")

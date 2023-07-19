@@ -18,12 +18,13 @@ import (
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/docker/docker/api/types"
 	registrytypes "github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/testutil/daemon"
 	"github.com/docker/docker/testutil/fixtures/plugin"
 	"github.com/docker/docker/testutil/registry"
 	"github.com/docker/docker/testutil/request"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
@@ -32,7 +33,7 @@ import (
 // TestPluginInvalidJSON tests that POST endpoints that expect a body return
 // the correct error when sending invalid JSON requests.
 func TestPluginInvalidJSON(t *testing.T) {
-	defer setupTest(t)()
+	t.Cleanup(setupTest(t))
 
 	// POST endpoints that accept / expect a JSON body;
 	endpoints := []string{
@@ -90,7 +91,7 @@ func TestPluginInvalidJSON(t *testing.T) {
 
 func TestPluginInstall(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
-	skip.If(t, testEnv.OSType == "windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	skip.If(t, testEnv.IsRootless, "rootless mode has different view of localhost")
 
 	ctx := context.Background()
@@ -199,7 +200,7 @@ func TestPluginInstall(t *testing.T) {
 func TestPluginsWithRuntimes(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, testEnv.IsRootless, "Test not supported on rootless due to buggy daemon setup in rootless mode due to daemon restart")
-	skip.If(t, testEnv.OSType == "windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
 	dir, err := os.MkdirTemp("", t.Name())
 	assert.NilError(t, err)
@@ -231,20 +232,20 @@ func TestPluginsWithRuntimes(t *testing.T) {
 	exec runc $@
 	`, dir)
 
-	assert.NilError(t, os.WriteFile(p, []byte(script), 0777))
+	assert.NilError(t, os.WriteFile(p, []byte(script), 0o777))
 
 	type config struct {
-		Runtimes map[string]types.Runtime `json:"runtimes"`
+		Runtimes map[string]system.Runtime `json:"runtimes"`
 	}
 
 	cfg, err := json.Marshal(config{
-		Runtimes: map[string]types.Runtime{
+		Runtimes: map[string]system.Runtime{
 			"myrt":     {Path: p},
 			"myrtArgs": {Path: p, Args: []string{"someArg"}},
 		},
 	})
 	configPath := filepath.Join(dir, "config.json")
-	os.WriteFile(configPath, cfg, 0644)
+	os.WriteFile(configPath, cfg, 0o644)
 
 	t.Run("No Args", func(t *testing.T) {
 		d.Restart(t, "--default-runtime=myrt", "--config-file="+configPath)
@@ -261,7 +262,7 @@ func TestPluginsWithRuntimes(t *testing.T) {
 
 func TestPluginBackCompatMediaTypes(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
-	skip.If(t, testEnv.OSType == "windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	skip.If(t, testEnv.IsRootless, "Rootless has a different view of localhost (needed for test registry access)")
 
 	defer setupTest(t)()
@@ -306,7 +307,7 @@ func TestPluginBackCompatMediaTypes(t *testing.T) {
 	assert.NilError(t, err)
 	defer rdr.Close()
 
-	var m v1.Manifest
+	var m ocispec.Manifest
 	assert.NilError(t, json.NewDecoder(rdr).Decode(&m))
 	assert.Check(t, is.Equal(m.MediaType, images.MediaTypeDockerSchema2Manifest))
 	assert.Check(t, is.Len(m.Layers, 1))

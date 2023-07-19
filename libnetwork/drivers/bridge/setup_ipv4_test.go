@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package bridge
 
@@ -13,7 +12,8 @@ import (
 
 func setupTestInterface(t *testing.T, nh *netlink.Handle) (*networkConfiguration, *bridgeInterface) {
 	config := &networkConfiguration{
-		BridgeName: DefaultBridgeName}
+		BridgeName: DefaultBridgeName,
+	}
 	br := &bridgeInterface{nlh: nh}
 
 	if err := setupDevice(config, br); err != nil {
@@ -75,7 +75,8 @@ func TestSetupGatewayIPv4(t *testing.T) {
 
 	config := &networkConfiguration{
 		BridgeName:         DefaultBridgeName,
-		DefaultGatewayIPv4: gw}
+		DefaultGatewayIPv4: gw,
+	}
 
 	br := &bridgeInterface{bridgeIPv4: nw, nlh: nh}
 

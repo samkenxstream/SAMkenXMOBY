@@ -44,6 +44,7 @@ create network namespaces and allocate interfaces for containers to use.
 package libnetwork
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -52,6 +53,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/libnetwork/cluster"
 	"github.com/docker/docker/libnetwork/config"
 	"github.com/docker/docker/libnetwork/datastore"
@@ -70,7 +72,6 @@ import (
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/moby/locker"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // NetworkWalker is a client provided function which will be used to walk the Networks.
@@ -109,11 +110,6 @@ type Controller struct {
 	mu               sync.Mutex
 }
 
-type initializer struct {
-	fn    func(driverapi.Registerer, map[string]interface{}) error
-	ntype string
-}
-
 // New creates a new instance of network controller.
 func New(cfgOptions ...config.Option) (*Controller, error) {
 	c := &Controller{
@@ -140,10 +136,8 @@ func New(cfgOptions ...config.Option) (*Controller, error) {
 		return nil, err
 	}
 
-	for _, i := range getInitializers() {
-		if err := i.fn(&c.drvRegistry, c.makeDriverConfig(i.ntype)); err != nil {
-			return nil, err
-		}
+	if err := registerNetworkDrivers(&c.drvRegistry, c.makeDriverConfig); err != nil {
+		return nil, err
 	}
 
 	if err := initIPAMDrivers(&c.ipamRegistry, c.cfg.PluginGetter, c.cfg.DefaultAddressPool); err != nil {
@@ -341,11 +335,9 @@ func (c *Controller) makeDriverConfig(ntype string) map[string]interface{} {
 		cfg[key] = val
 	}
 
-	drvCfg, ok := c.cfg.DriverCfg[ntype]
-	if ok {
-		for k, v := range drvCfg.(map[string]interface{}) {
-			cfg[k] = v
-		}
+	// Merge in the existing config for this driver.
+	for k, v := range c.cfg.DriverConfig(ntype) {
+		cfg[k] = v
 	}
 
 	if c.cfg.Scope.IsValid() {
@@ -418,7 +410,7 @@ func (c *Controller) pushNodeDiscovery(d driverapi.Driver, cap driverapi.Capabil
 			err = d.DiscoverDelete(discoverapi.NodeDiscovery, nodeData)
 		}
 		if err != nil {
-			logrus.Debugf("discovery notification error: %v", err)
+			log.G(context.TODO()).Debugf("discovery notification error: %v", err)
 		}
 	}
 }
@@ -486,7 +478,7 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 		}
 	}
 
-	if !config.IsValidName(name) {
+	if strings.TrimSpace(name) == "" {
 		return nil, ErrInvalidName(name)
 	}
 
@@ -570,7 +562,7 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 		defer func() {
 			if err == nil && !skipCfgEpCount {
 				if err := t.getEpCnt().IncEndpointCnt(); err != nil {
-					logrus.Warnf("Failed to update reference count for configuration network %q on creation of network %q: %v",
+					log.G(context.TODO()).Warnf("Failed to update reference count for configuration network %q on creation of network %q: %v",
 						t.Name(), nw.Name(), err)
 				}
 			}
@@ -600,7 +592,7 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 	defer func() {
 		if err != nil {
 			if e := nw.deleteNetwork(); e != nil {
-				logrus.Warnf("couldn't roll back driver network on network %s creation failure: %v", nw.name, err)
+				log.G(context.TODO()).Warnf("couldn't roll back driver network on network %s creation failure: %v", nw.name, err)
 			}
 		}
 	}()
@@ -631,7 +623,7 @@ addToStore:
 	defer func() {
 		if err != nil {
 			if e := c.deleteFromStore(epCnt); e != nil {
-				logrus.Warnf("could not rollback from store, epCnt %v on failure (%v): %v", epCnt, err, e)
+				log.G(context.TODO()).Warnf("could not rollback from store, epCnt %v on failure (%v): %v", epCnt, err, e)
 			}
 		}
 	}()
@@ -643,7 +635,7 @@ addToStore:
 	defer func() {
 		if err != nil {
 			if e := c.deleteFromStore(nw); e != nil {
-				logrus.Warnf("could not rollback from store, network %v on failure (%v): %v", nw, err, e)
+				log.G(context.TODO()).Warnf("could not rollback from store, network %v on failure (%v): %v", nw, err, e)
 			}
 		}
 	}()
@@ -657,7 +649,7 @@ addToStore:
 		if err != nil {
 			nw.cancelDriverWatches()
 			if e := nw.leaveCluster(); e != nil {
-				logrus.Warnf("Failed to leave agent cluster on network %s on failure (%v): %v", nw.name, err, e)
+				log.G(context.TODO()).Warnf("Failed to leave agent cluster on network %s on failure (%v): %v", nw.name, err, e)
 			}
 		}
 	}()
@@ -684,7 +676,7 @@ var joinCluster NetworkWalker = func(nw Network) bool {
 		return false
 	}
 	if err := n.joinCluster(); err != nil {
-		logrus.Errorf("Failed to join network %s (%s) into agent cluster: %v", n.Name(), n.ID(), err)
+		log.G(context.TODO()).Errorf("Failed to join network %s (%s) into agent cluster: %v", n.Name(), n.ID(), err)
 	}
 	n.addDriverWatches()
 	return false
@@ -693,7 +685,7 @@ var joinCluster NetworkWalker = func(nw Network) bool {
 func (c *Controller) reservePools() {
 	networks, err := c.getNetworks()
 	if err != nil {
-		logrus.Warnf("Could not retrieve networks from local store during ipam allocation for existing networks: %v", err)
+		log.G(context.TODO()).Warnf("Could not retrieve networks from local store during ipam allocation for existing networks: %v", err)
 		return
 	}
 
@@ -728,26 +720,26 @@ func (c *Controller) reservePools() {
 		}
 		// Reserve pools
 		if err := n.ipamAllocate(); err != nil {
-			logrus.Warnf("Failed to allocate ipam pool(s) for network %q (%s): %v", n.Name(), n.ID(), err)
+			log.G(context.TODO()).Warnf("Failed to allocate ipam pool(s) for network %q (%s): %v", n.Name(), n.ID(), err)
 		}
 		// Reserve existing endpoints' addresses
 		ipam, _, err := n.getController().getIPAMDriver(n.ipamType)
 		if err != nil {
-			logrus.Warnf("Failed to retrieve ipam driver for network %q (%s) during address reservation", n.Name(), n.ID())
+			log.G(context.TODO()).Warnf("Failed to retrieve ipam driver for network %q (%s) during address reservation", n.Name(), n.ID())
 			continue
 		}
 		epl, err := n.getEndpointsFromStore()
 		if err != nil {
-			logrus.Warnf("Failed to retrieve list of current endpoints on network %q (%s)", n.Name(), n.ID())
+			log.G(context.TODO()).Warnf("Failed to retrieve list of current endpoints on network %q (%s)", n.Name(), n.ID())
 			continue
 		}
 		for _, ep := range epl {
 			if ep.Iface() == nil {
-				logrus.Warnf("endpoint interface is empty for %q (%s)", ep.Name(), ep.ID())
+				log.G(context.TODO()).Warnf("endpoint interface is empty for %q (%s)", ep.Name(), ep.ID())
 				continue
 			}
 			if err := ep.assignAddress(ipam, true, ep.Iface().AddressIPv6() != nil); err != nil {
-				logrus.Warnf("Failed to reserve current address for endpoint %q (%s) on network %q (%s)",
+				log.G(context.TODO()).Warnf("Failed to reserve current address for endpoint %q (%s) on network %q (%s)",
 					ep.Name(), ep.ID(), n.Name(), n.ID())
 			}
 		}
@@ -757,7 +749,7 @@ func (c *Controller) reservePools() {
 func doReplayPoolReserve(n *network) bool {
 	_, caps, err := n.getController().getIPAMDriver(n.ipamType)
 	if err != nil {
-		logrus.Warnf("Failed to retrieve ipam driver for network %q (%s): %v", n.Name(), n.ID(), err)
+		log.G(context.TODO()).Warnf("Failed to retrieve ipam driver for network %q (%s): %v", n.Name(), n.ID(), err)
 		return false
 	}
 	return caps.RequiresRequestReplay
@@ -946,9 +938,8 @@ func (c *Controller) NewSandbox(containerID string, options ...SandboxOption) (*
 		err := sb.osSbox.InvokeFunc(func() {
 			sb.osSbox.ApplyOSTweaks(sb.oslTypes)
 		})
-
 		if err != nil {
-			logrus.Errorf("Failed to apply performance tuning sysctls to the sandbox: %v", err)
+			log.G(context.TODO()).Errorf("Failed to apply performance tuning sysctls to the sandbox: %v", err)
 		}
 		// Keep this just so performance is not changed
 		sb.osSbox.ApplyOSTweaks(sb.oslTypes)
@@ -1153,10 +1144,7 @@ func (c *Controller) iptablesEnabled() bool {
 		return false
 	}
 	// parse map cfg["bridge"]["generic"]["EnableIPTable"]
-	cfgBridge, ok := c.cfg.DriverCfg["bridge"].(map[string]interface{})
-	if !ok {
-		return false
-	}
+	cfgBridge := c.cfg.DriverConfig("bridge")
 	cfgGeneric, ok := cfgBridge[netlabel.GenericData].(options.Generic)
 	if !ok {
 		return false
@@ -1177,10 +1165,7 @@ func (c *Controller) ip6tablesEnabled() bool {
 		return false
 	}
 	// parse map cfg["bridge"]["generic"]["EnableIP6Table"]
-	cfgBridge, ok := c.cfg.DriverCfg["bridge"].(map[string]interface{})
-	if !ok {
-		return false
-	}
+	cfgBridge := c.cfg.DriverConfig("bridge")
 	cfgGeneric, ok := cfgBridge[netlabel.GenericData].(options.Generic)
 	if !ok {
 		return false

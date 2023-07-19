@@ -5,8 +5,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/errdefs"
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 	"github.com/docker/docker/restartmanager"
@@ -29,6 +31,8 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 	var exitStatus container.ExitStatus
 	c.Lock()
 
+	cfg := daemon.config()
+
 	// Health checks will be automatically restarted if/when the
 	// container is started again.
 	daemon.stopHealthchecks(c)
@@ -39,7 +43,10 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 		es, err := tsk.Delete(ctx)
 		cancel()
 		if err != nil {
-			logrus.WithError(err).WithField("container", c.ID).Warnf("failed to delete container from containerd")
+			log.G(ctx).WithFields(logrus.Fields{
+				logrus.ErrorKey: err,
+				"container":     c.ID,
+			}).Warn("failed to delete container from containerd")
 		} else {
 			exitStatus = container.ExitStatus{
 				ExitCode: int(es.ExitCode()),
@@ -66,34 +73,37 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 	execDuration := time.Since(c.StartedAt)
 	restart, wait, err := c.RestartManager().ShouldRestart(uint32(exitStatus.ExitCode), daemonShutdown || c.HasBeenManuallyStopped, execDuration)
 	if err != nil {
-		logrus.WithError(err).
-			WithField("container", c.ID).
-			WithField("restartCount", c.RestartCount).
-			WithField("exitStatus", exitStatus).
-			WithField("daemonShuttingDown", daemonShutdown).
-			WithField("hasBeenManuallyStopped", c.HasBeenManuallyStopped).
-			WithField("execDuration", execDuration).
-			Warn("ShouldRestart failed, container will not be restarted")
+		log.G(ctx).WithFields(logrus.Fields{
+			logrus.ErrorKey:          err,
+			"container":              c.ID,
+			"restartCount":           c.RestartCount,
+			"exitStatus":             exitStatus,
+			"daemonShuttingDown":     daemonShutdown,
+			"hasBeenManuallyStopped": c.HasBeenManuallyStopped,
+			"execDuration":           execDuration,
+		}).Warn("ShouldRestart failed, container will not be restarted")
 		restart = false
 	}
 
 	attributes := map[string]string{
-		"exitCode": strconv.Itoa(exitStatus.ExitCode),
+		"exitCode":     strconv.Itoa(exitStatus.ExitCode),
+		"execDuration": strconv.Itoa(int(execDuration.Seconds())),
 	}
 	daemon.Cleanup(c)
 
 	if restart {
 		c.RestartCount++
-		logrus.WithField("container", c.ID).
-			WithField("restartCount", c.RestartCount).
-			WithField("exitStatus", exitStatus).
-			WithField("manualRestart", c.HasBeenManuallyRestarted).
-			Debug("Restarting container")
+		log.G(ctx).WithFields(logrus.Fields{
+			"container":     c.ID,
+			"restartCount":  c.RestartCount,
+			"exitStatus":    exitStatus,
+			"manualRestart": c.HasBeenManuallyRestarted,
+		}).Debug("Restarting container")
 		c.SetRestarting(&exitStatus)
 	} else {
 		c.SetStopped(&exitStatus)
 		if !c.HasBeenManuallyRestarted {
-			defer daemon.autoRemove(c)
+			defer daemon.autoRemove(&cfg.Config, c)
 		}
 	}
 	defer c.Unlock() // needs to be called before autoRemove
@@ -111,8 +121,9 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 				// But containerStart will use daemon.netController segment.
 				// So to avoid panic at startup process, here must wait util daemon restore done.
 				daemon.waitForStartupDone()
-				if err = daemon.containerStart(context.Background(), c, "", "", false); err != nil {
-					logrus.Debugf("failed to restart container: %+v", err)
+				cfg := daemon.config() // Apply the most up-to-date daemon config to the restarted container.
+				if err = daemon.containerStart(context.Background(), cfg, c, "", "", false); err != nil {
+					log.G(ctx).Debugf("failed to restart container: %+v", err)
 				}
 			}
 			if err != nil {
@@ -121,9 +132,9 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 				daemon.setStateCounter(c)
 				c.CheckpointTo(daemon.containersReplica)
 				c.Unlock()
-				defer daemon.autoRemove(c)
+				defer daemon.autoRemove(&cfg.Config, c)
 				if err != restartmanager.ErrRestartCanceled {
-					logrus.Errorf("restartmanger wait error: %+v", err)
+					log.G(ctx).Errorf("restartmanger wait error: %+v", err)
 				}
 			}
 		}()
@@ -169,7 +180,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 			// Remove the exec command from the container's store only and not the
 			// daemon's store so that the exec command can be inspected. Remove it
 			// before mutating execConfig to maintain the invariant that
-			// c.ExecCommands only contain execs in the Running state.
+			// c.ExecCommands only contains execs that have not exited.
 			c.ExecCommands.Delete(execConfig.ID)
 
 			execConfig.ExitCode = &ec
@@ -180,19 +191,30 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 			cancel()
 
 			if err := execConfig.CloseStreams(); err != nil {
-				logrus.Errorf("failed to cleanup exec %s streams: %s", c.ID, err)
+				log.G(ctx).Errorf("failed to cleanup exec %s streams: %s", c.ID, err)
 			}
 
 			exitCode = ec
 
-			go func() {
-				if _, err := execConfig.Process.Delete(context.Background()); err != nil {
-					logrus.WithError(err).WithFields(logrus.Fields{
-						"container": ei.ContainerID,
-						"process":   ei.ProcessID,
-					}).Warn("failed to delete process")
-				}
-			}()
+			// If the exec failed at start in such a way that containerd
+			// publishes an exit event for it, we will race processing the event
+			// with daemon.ContainerExecStart() removing the exec from
+			// c.ExecCommands. If we win the race, we will find that there is no
+			// process to clean up. (And ContainerExecStart will clobber the
+			// exit code we set.) Prevent a nil-dereferenc panic in that
+			// situation to restore the status quo where this is merely a
+			// logical race condition.
+			if execConfig.Process != nil {
+				go func() {
+					if _, err := execConfig.Process.Delete(context.Background()); err != nil {
+						log.G(ctx).WithFields(logrus.Fields{
+							logrus.ErrorKey: err,
+							"container":     ei.ContainerID,
+							"process":       ei.ProcessID,
+						}).Warn("failed to delete process")
+					}
+				}()
+			}
 		}
 		attributes := map[string]string{
 			"execID":   ei.ProcessID,
@@ -210,8 +232,10 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 				if errdefs.IsNotFound(err) {
 					// The container was started by not-docker and so could have been deleted by
 					// not-docker before we got around to loading it from containerd.
-					logrus.WithField("container", c.ID).WithError(err).
-						Debug("could not load containerd container for start event")
+					log.G(context.TODO()).WithFields(logrus.Fields{
+						logrus.ErrorKey: err,
+						"container":     c.ID,
+					}).Debug("could not load containerd container for start event")
 					return nil
 				}
 				return err
@@ -219,8 +243,10 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 			tsk, err := ctr.Task(context.Background())
 			if err != nil {
 				if errdefs.IsNotFound(err) {
-					logrus.WithField("container", c.ID).WithError(err).
-						Debug("failed to load task for externally-started container")
+					log.G(context.TODO()).WithFields(logrus.Fields{
+						logrus.ErrorKey: err,
+						"container":     c.ID,
+					}).Debug("failed to load task for externally-started container")
 					return nil
 				}
 				return err
@@ -269,7 +295,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 	return nil
 }
 
-func (daemon *Daemon) autoRemove(c *container.Container) {
+func (daemon *Daemon) autoRemove(cfg *config.Config, c *container.Container) {
 	c.Lock()
 	ar := c.HostConfig.AutoRemove
 	c.Unlock()
@@ -277,7 +303,7 @@ func (daemon *Daemon) autoRemove(c *container.Container) {
 		return
 	}
 
-	err := daemon.ContainerRm(c.ID, &types.ContainerRmConfig{ForceRemove: true, RemoveVolume: true})
+	err := daemon.containerRm(cfg, c.ID, &types.ContainerRmConfig{ForceRemove: true, RemoveVolume: true})
 	if err == nil {
 		return
 	}
@@ -285,5 +311,5 @@ func (daemon *Daemon) autoRemove(c *container.Container) {
 		return
 	}
 
-	logrus.WithError(err).WithField("container", c.ID).Error("error removing container")
+	log.G(context.TODO()).WithFields(logrus.Fields{logrus.ErrorKey: err, "container": c.ID}).Error("error removing container")
 }

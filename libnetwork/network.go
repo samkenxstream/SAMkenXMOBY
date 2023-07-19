@@ -1,6 +1,7 @@
 package libnetwork
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/libnetwork/config"
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/etchosts"
@@ -21,7 +22,6 @@ import (
 	"github.com/docker/docker/libnetwork/options"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/sirupsen/logrus"
 )
 
 // A Network represents a logical connectivity zone that containers may
@@ -622,7 +622,7 @@ func (n *network) UnmarshalJSON(b []byte) (err error) {
 	if v, ok := netMap["created"]; ok {
 		// n.created is time.Time but marshalled as string
 		if err = n.created.UnmarshalText([]byte(v.(string))); err != nil {
-			logrus.Warnf("failed to unmarshal creation time %v: %v", v, err)
+			log.G(context.TODO()).Warnf("failed to unmarshal creation time %v: %v", v, err)
 			n.created = time.Time{}
 		}
 	}
@@ -1025,7 +1025,7 @@ func (n *network) delete(force bool, rmLBEndpoint bool) error {
 				return err
 			}
 			// continue deletion when force is true even on error
-			logrus.Warnf("Error deleting load balancer sandbox: %v", err)
+			log.G(context.TODO()).Warnf("Error deleting load balancer sandbox: %v", err)
 		}
 		// Reload the network from the store to update the epcnt.
 		n, err = c.getNetworkFromStore(id)
@@ -1048,11 +1048,11 @@ func (n *network) delete(force bool, rmLBEndpoint bool) error {
 	if n.ConfigFrom() != "" {
 		if t, err := c.getConfigNetwork(n.ConfigFrom()); err == nil {
 			if err := t.getEpCnt().DecEndpointCnt(); err != nil {
-				logrus.Warnf("Failed to update reference count for configuration network %q on removal of network %q: %v",
+				log.G(context.TODO()).Warnf("Failed to update reference count for configuration network %q on removal of network %q: %v",
 					t.Name(), n.Name(), err)
 			}
 		} else {
-			logrus.Warnf("Could not find configuration network %q during removal of network %q", n.configFrom, n.Name())
+			log.G(context.TODO()).Warnf("Could not find configuration network %q during removal of network %q", n.configFrom, n.Name())
 		}
 	}
 
@@ -1061,9 +1061,6 @@ func (n *network) delete(force bool, rmLBEndpoint bool) error {
 	}
 
 	n.ipamRelease()
-	if err = c.updateToStore(n); err != nil {
-		logrus.Warnf("Failed to update store after ipam release for network %s (%s): %v", n.Name(), n.ID(), err)
-	}
 
 	// We are about to delete the network. Leave the gossip
 	// cluster for the network to stop all incoming network
@@ -1073,7 +1070,7 @@ func (n *network) delete(force bool, rmLBEndpoint bool) error {
 	// bindings cleanup requires the network in the store.
 	n.cancelDriverWatches()
 	if err = n.leaveCluster(); err != nil {
-		logrus.Errorf("Failed leaving network %s from the agent cluster: %v", n.Name(), err)
+		log.G(context.TODO()).Errorf("Failed leaving network %s from the agent cluster: %v", n.Name(), err)
 	}
 
 	// Cleanup the service discovery for this network
@@ -1091,7 +1088,7 @@ func (n *network) delete(force bool, rmLBEndpoint bool) error {
 		if !force {
 			return err
 		}
-		logrus.Debugf("driver failed to delete stale network %s (%s): %v", n.Name(), n.ID(), err)
+		log.G(context.TODO()).Debugf("driver failed to delete stale network %s (%s): %v", n.Name(), n.ID(), err)
 	}
 
 removeFromStore:
@@ -1102,7 +1099,7 @@ removeFromStore:
 		if !force {
 			return fmt.Errorf("error deleting network endpoint count from store: %v", err)
 		}
-		logrus.Debugf("Error deleting endpoint count from store for stale network %s (%s) for deletion: %v", n.Name(), n.ID(), err)
+		log.G(context.TODO()).Debugf("Error deleting endpoint count from store for stale network %s (%s) for deletion: %v", n.Name(), n.ID(), err)
 	}
 
 	if err = c.deleteFromStore(n); err != nil {
@@ -1125,7 +1122,7 @@ func (n *network) deleteNetwork() error {
 		}
 
 		if _, ok := err.(types.MaskableError); !ok {
-			logrus.Warnf("driver error deleting network %s : %v", n.name, err)
+			log.G(context.TODO()).Warnf("driver error deleting network %s : %v", n.name, err)
 		}
 	}
 
@@ -1152,7 +1149,7 @@ func (n *network) addEndpoint(ep *Endpoint) error {
 
 func (n *network) CreateEndpoint(name string, options ...EndpointOption) (*Endpoint, error) {
 	var err error
-	if !config.IsValidName(name) {
+	if strings.TrimSpace(name) == "" {
 		return nil, ErrInvalidName(name)
 	}
 
@@ -1181,7 +1178,7 @@ func (n *network) createEndpoint(name string, options ...EndpointOption) (*Endpo
 	ep.network = n
 	ep.network, err = ep.getNetworkFromStore()
 	if err != nil {
-		logrus.Errorf("failed to get network during CreateEndpoint: %v", err)
+		log.G(context.TODO()).Errorf("failed to get network during CreateEndpoint: %v", err)
 		return nil, err
 	}
 	n = ep.network
@@ -1230,7 +1227,7 @@ func (n *network) createEndpoint(name string, options ...EndpointOption) (*Endpo
 	defer func() {
 		if err != nil {
 			if e := ep.deleteEndpoint(false); e != nil {
-				logrus.Warnf("cleaning up endpoint failed %s : %v", name, e)
+				log.G(context.TODO()).Warnf("cleaning up endpoint failed %s : %v", name, e)
 			}
 		}
 	}()
@@ -1243,7 +1240,7 @@ func (n *network) createEndpoint(name string, options ...EndpointOption) (*Endpo
 	defer func() {
 		if err != nil {
 			if e := n.getController().deleteFromStore(ep); e != nil {
-				logrus.Warnf("error rolling back endpoint %s from store: %v", name, e)
+				log.G(context.TODO()).Warnf("error rolling back endpoint %s from store: %v", name, e)
 			}
 		}
 	}()
@@ -1271,7 +1268,7 @@ func (n *network) createEndpoint(name string, options ...EndpointOption) (*Endpo
 func (n *network) Endpoints() []*Endpoint {
 	endpoints, err := n.getEndpointsFromStore()
 	if err != nil {
-		logrus.Error(err)
+		log.G(context.TODO()).Error(err)
 	}
 	return endpoints
 }
@@ -1403,7 +1400,7 @@ func (n *network) addSvcRecords(eID, name, serviceID string, epIP, epIPv6 net.IP
 		return
 	}
 	networkID := n.ID()
-	logrus.Debugf("%s (%.7s).addSvcRecords(%s, %s, %s, %t) %s sid:%s", eID, networkID, name, epIP, epIPv6, ipMapUpdate, method, serviceID)
+	log.G(context.TODO()).Debugf("%s (%.7s).addSvcRecords(%s, %s, %s, %t) %s sid:%s", eID, networkID, name, epIP, epIPv6, ipMapUpdate, method, serviceID)
 
 	c := n.getController()
 	c.mu.Lock()
@@ -1435,7 +1432,7 @@ func (n *network) deleteSvcRecords(eID, name, serviceID string, epIP net.IP, epI
 		return
 	}
 	networkID := n.ID()
-	logrus.Debugf("%s (%.7s).deleteSvcRecords(%s, %s, %s, %t) %s sid:%s ", eID, networkID, name, epIP, epIPv6, ipMapUpdate, method, serviceID)
+	log.G(context.TODO()).Debugf("%s (%.7s).deleteSvcRecords(%s, %s, %s, %t) %s sid:%s ", eID, networkID, name, epIP, epIPv6, ipMapUpdate, method, serviceID)
 
 	c := n.getController()
 	c.mu.Lock()
@@ -1493,7 +1490,7 @@ func (n *network) getSvcRecords(ep *Endpoint) []etchosts.Record {
 			continue
 		}
 		if len(mapEntryList) == 0 {
-			logrus.Warnf("Found empty list of IP addresses for service %s on network %s (%s)", k, n.name, n.id)
+			log.G(context.TODO()).Warnf("Found empty list of IP addresses for service %s on network %s (%s)", k, n.name, n.id)
 			continue
 		}
 
@@ -1574,7 +1571,7 @@ func (n *network) requestPoolHelper(ipam ipamapi.Ipam, addressSpace, preferredPo
 		// pools.
 		defer func() {
 			if err := ipam.ReleasePool(poolID); err != nil {
-				logrus.Warnf("Failed to release overlapping pool %s while returning from pool request helper for network %s", pool, n.Name())
+				log.G(context.TODO()).Warnf("Failed to release overlapping pool %s while returning from pool request helper for network %s", pool, n.Name())
 			}
 		}()
 
@@ -1612,7 +1609,7 @@ func (n *network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 
 	*infoList = make([]*IpamInfo, len(*cfgList))
 
-	logrus.Debugf("Allocating IPv%d pools for network %s (%s)", ipVer, n.Name(), n.ID())
+	log.G(context.TODO()).Debugf("Allocating IPv%d pools for network %s (%s)", ipVer, n.Name(), n.ID())
 
 	for i, cfg := range *cfgList {
 		if err = cfg.Validate(); err != nil {
@@ -1630,7 +1627,7 @@ func (n *network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 		defer func() {
 			if err != nil {
 				if err := ipam.ReleasePool(d.PoolID); err != nil {
-					logrus.Warnf("Failed to release address pool %s after failure to create network %s (%s)", d.PoolID, n.Name(), n.ID())
+					log.G(context.TODO()).Warnf("Failed to release address pool %s after failure to create network %s (%s)", d.PoolID, n.Name(), n.ID())
 				}
 			}
 		}()
@@ -1645,7 +1642,7 @@ func (n *network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 		// irrespective of whether ipam driver returned a gateway already.
 		// If none of the above is true, libnetwork will allocate one.
 		if cfg.Gateway != "" || d.Gateway == nil {
-			var gatewayOpts = map[string]string{
+			gatewayOpts := map[string]string{
 				ipamapi.RequestAddressType: netlabel.Gateway,
 			}
 			if d.Gateway, _, err = ipam.RequestAddress(d.PoolID, net.ParseIP(cfg.Gateway), gatewayOpts); err != nil {
@@ -1682,7 +1679,7 @@ func (n *network) ipamRelease() {
 	}
 	ipam, _, err := n.getController().getIPAMDriver(n.ipamType)
 	if err != nil {
-		logrus.Warnf("Failed to retrieve ipam driver to release address pool(s) on delete of network %s (%s): %v", n.Name(), n.ID(), err)
+		log.G(context.TODO()).Warnf("Failed to retrieve ipam driver to release address pool(s) on delete of network %s (%s): %v", n.Name(), n.ID(), err)
 		return
 	}
 	n.ipamReleaseVersion(4, ipam)
@@ -1698,7 +1695,7 @@ func (n *network) ipamReleaseVersion(ipVer int, ipam ipamapi.Ipam) {
 	case 6:
 		infoList = &n.ipamV6Info
 	default:
-		logrus.Warnf("incorrect ip version passed to ipam release: %d", ipVer)
+		log.G(context.TODO()).Warnf("incorrect ip version passed to ipam release: %d", ipVer)
 		return
 	}
 
@@ -1706,25 +1703,25 @@ func (n *network) ipamReleaseVersion(ipVer int, ipam ipamapi.Ipam) {
 		return
 	}
 
-	logrus.Debugf("releasing IPv%d pools from network %s (%s)", ipVer, n.Name(), n.ID())
+	log.G(context.TODO()).Debugf("releasing IPv%d pools from network %s (%s)", ipVer, n.Name(), n.ID())
 
 	for _, d := range *infoList {
 		if d.Gateway != nil {
 			if err := ipam.ReleaseAddress(d.PoolID, d.Gateway.IP); err != nil {
-				logrus.Warnf("Failed to release gateway ip address %s on delete of network %s (%s): %v", d.Gateway.IP, n.Name(), n.ID(), err)
+				log.G(context.TODO()).Warnf("Failed to release gateway ip address %s on delete of network %s (%s): %v", d.Gateway.IP, n.Name(), n.ID(), err)
 			}
 		}
 		if d.IPAMData.AuxAddresses != nil {
 			for k, nw := range d.IPAMData.AuxAddresses {
 				if d.Pool.Contains(nw.IP) {
 					if err := ipam.ReleaseAddress(d.PoolID, nw.IP); err != nil && err != ipamapi.ErrIPOutOfRange {
-						logrus.Warnf("Failed to release secondary ip address %s (%v) on delete of network %s (%s): %v", k, nw.IP, n.Name(), n.ID(), err)
+						log.G(context.TODO()).Warnf("Failed to release secondary ip address %s (%v) on delete of network %s (%s): %v", k, nw.IP, n.Name(), n.ID(), err)
 					}
 				}
 			}
 		}
 		if err := ipam.ReleasePool(d.PoolID); err != nil {
-			logrus.Warnf("Failed to release address pool %s on delete of network %s (%s): %v", d.PoolID, n.Name(), n.ID(), err)
+			log.G(context.TODO()).Warnf("Failed to release address pool %s on delete of network %s (%s): %v", d.PoolID, n.Name(), n.ID(), err)
 		}
 	}
 
@@ -1826,7 +1823,7 @@ func (n *network) IpamConfig() (string, map[string]string, []*IpamConf, []*IpamC
 	for i, c := range n.ipamV4Config {
 		cc := &IpamConf{}
 		if err := c.CopyTo(cc); err != nil {
-			logrus.WithError(err).Error("Error copying ipam ipv4 config")
+			log.G(context.TODO()).WithError(err).Error("Error copying ipam ipv4 config")
 		}
 		v4L[i] = cc
 	}
@@ -1834,7 +1831,7 @@ func (n *network) IpamConfig() (string, map[string]string, []*IpamConf, []*IpamC
 	for i, c := range n.ipamV6Config {
 		cc := &IpamConf{}
 		if err := c.CopyTo(cc); err != nil {
-			logrus.WithError(err).Debug("Error copying ipam ipv6 config")
+			log.G(context.TODO()).WithError(err).Debug("Error copying ipam ipv6 config")
 		}
 		v6L[i] = cc
 	}
@@ -1852,7 +1849,7 @@ func (n *network) IpamInfo() ([]*IpamInfo, []*IpamInfo) {
 	for i, info := range n.ipamV4Info {
 		ic := &IpamInfo{}
 		if err := info.CopyTo(ic); err != nil {
-			logrus.WithError(err).Error("Error copying ipv4 ipam config")
+			log.G(context.TODO()).WithError(err).Error("Error copying ipv4 ipam config")
 		}
 		v4Info[i] = ic
 	}
@@ -1860,7 +1857,7 @@ func (n *network) IpamInfo() ([]*IpamInfo, []*IpamInfo) {
 	for i, info := range n.ipamV6Info {
 		ic := &IpamInfo{}
 		if err := info.CopyTo(ic); err != nil {
-			logrus.WithError(err).Error("Error copying ipv6 ipam config")
+			log.G(context.TODO()).WithError(err).Error("Error copying ipv6 ipam config")
 		}
 		v6Info[i] = ic
 	}
@@ -1921,7 +1918,7 @@ func (n *network) Labels() map[string]string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	var lbls = make(map[string]string, len(n.labels))
+	lbls := make(map[string]string, len(n.labels))
 	for k, v := range n.labels {
 		lbls[k] = v
 	}
@@ -2068,7 +2065,7 @@ func (n *network) ResolveService(name string) ([]*net.SRV, []net.IP) {
 	srv := []*net.SRV{}
 	ip := []net.IP{}
 
-	logrus.Debugf("Service name To resolve: %v", name)
+	log.G(context.TODO()).Debugf("Service name To resolve: %v", name)
 
 	// There are DNS implementations that allow SRV queries for names not in
 	// the format defined by RFC 2782. Hence specific validations checks are
@@ -2172,7 +2169,7 @@ func (n *network) createLoadBalancerSandbox() (retErr error) {
 	defer func() {
 		if retErr != nil {
 			if e := n.ctrlr.SandboxDestroy(sandboxName); e != nil {
-				logrus.Warnf("could not delete sandbox %s on failure on failure (%v): %v", sandboxName, retErr, e)
+				log.G(context.TODO()).Warnf("could not delete sandbox %s on failure on failure (%v): %v", sandboxName, retErr, e)
 			}
 		}
 	}()
@@ -2193,7 +2190,7 @@ func (n *network) createLoadBalancerSandbox() (retErr error) {
 	defer func() {
 		if retErr != nil {
 			if e := ep.Delete(true); e != nil {
-				logrus.Warnf("could not delete endpoint %s on failure on failure (%v): %v", endpointName, retErr, e)
+				log.G(context.TODO()).Warnf("could not delete endpoint %s on failure on failure (%v): %v", endpointName, retErr, e)
 			}
 		}
 	}()
@@ -2216,21 +2213,21 @@ func (n *network) deleteLoadBalancerSandbox() error {
 
 	endpoint, err := n.EndpointByName(endpointName)
 	if err != nil {
-		logrus.Warnf("Failed to find load balancer endpoint %s on network %s: %v", endpointName, name, err)
+		log.G(context.TODO()).Warnf("Failed to find load balancer endpoint %s on network %s: %v", endpointName, name, err)
 	} else {
 		info := endpoint.Info()
 		if info != nil {
 			sb := info.Sandbox()
 			if sb != nil {
 				if err := sb.DisableService(); err != nil {
-					logrus.Warnf("Failed to disable service on sandbox %s: %v", sandboxName, err)
+					log.G(context.TODO()).Warnf("Failed to disable service on sandbox %s: %v", sandboxName, err)
 					// Ignore error and attempt to delete the load balancer endpoint
 				}
 			}
 		}
 
 		if err := endpoint.Delete(true); err != nil {
-			logrus.Warnf("Failed to delete endpoint %s (%s) in %s: %v", endpoint.Name(), endpoint.ID(), sandboxName, err)
+			log.G(context.TODO()).Warnf("Failed to delete endpoint %s (%s) in %s: %v", endpoint.Name(), endpoint.ID(), sandboxName, err)
 			// Ignore error and attempt to delete the sandbox.
 		}
 	}

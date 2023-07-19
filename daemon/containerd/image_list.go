@@ -3,19 +3,21 @@ package containerd
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"time"
 
-	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/containerd/labels"
+	"github.com/containerd/containerd/log"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/moby/buildkit/util/attestation"
+	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -23,9 +25,11 @@ import (
 var acceptedImageFilterTags = map[string]bool{
 	"dangling":  true,
 	"label":     true,
+	"label!":    true,
 	"before":    true,
 	"since":     true,
 	"reference": true,
+	"until":     true,
 }
 
 // Images returns a filtered list of images.
@@ -71,7 +75,7 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 		layers    map[digest.Digest]int
 	)
 	if opts.SharedSize {
-		root = make([]*[]digest.Digest, len(imgs))
+		root = make([]*[]digest.Digest, 0, len(imgs))
 		layers = make(map[digest.Digest]int)
 	}
 
@@ -81,73 +85,41 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 			continue
 		}
 
-		err := images.Walk(ctx, images.HandlerFunc(func(ctx context.Context, desc v1.Descriptor) ([]v1.Descriptor, error) {
-			if images.IsIndexType(desc.MediaType) {
-				return images.Children(ctx, contentStore, desc)
+		err := i.walkImageManifests(ctx, img, func(img *ImageManifest) error {
+			if isPseudo, err := img.IsPseudoImage(ctx); isPseudo || err != nil {
+				return err
 			}
 
-			if images.IsManifestType(desc.MediaType) {
-				// Ignore buildkit attestation manifests
-				// https://github.com/moby/buildkit/blob/v0.11.4/docs/attestations/attestation-storage.md
-				// This would have also been caught by the isImageManifest call below, but it requires
-				// an additional content read and deserialization of Manifest.
-				if _, has := desc.Annotations[attestation.DockerAnnotationReferenceType]; has {
-					return nil, nil
-				}
+			available, err := img.CheckContentAvailable(ctx)
+			if err != nil {
+				log.G(ctx).WithFields(logrus.Fields{
+					logrus.ErrorKey: err,
+					"manifest":      img.Target(),
+					"image":         img.Name(),
+				}).Warn("checking availability of platform specific manifest failed")
+				return nil
+			}
 
-				mfst, err := images.Manifest(ctx, contentStore, desc, platforms.All)
-				if err != nil {
-					if cerrdefs.IsNotFound(err) {
-						return nil, nil
-					}
-					return nil, err
-				}
+			if !available {
+				return nil
+			}
 
-				if !isImageManifest(mfst) {
-					return nil, nil
-				}
+			image, chainIDs, err := i.singlePlatformImage(ctx, contentStore, img)
+			if err != nil {
+				return err
+			}
 
-				platform, err := getManifestPlatform(ctx, contentStore, desc, mfst.Config)
-				if err != nil {
-					if cerrdefs.IsNotFound(err) {
-						return nil, nil
-					}
-					return nil, err
-				}
+			summaries = append(summaries, image)
 
-				pm := platforms.OnlyStrict(platform)
-				available, _, _, missing, err := images.Check(ctx, contentStore, img.Target, pm)
-				if err != nil {
-					logrus.WithFields(logrus.Fields{
-						logrus.ErrorKey: err,
-						"platform":      platform,
-						"image":         img.Target,
-					}).Warn("checking availability of platform content failed")
-					return nil, nil
-				}
-				if !available || len(missing) > 0 {
-					return nil, nil
-				}
-
-				c8dImage := containerd.NewImageWithPlatform(i.client, img, pm)
-				image, chainIDs, err := i.singlePlatformImage(ctx, contentStore, c8dImage)
-				if err != nil {
-					return nil, err
-				}
-
-				summaries = append(summaries, image)
-
-				if opts.SharedSize {
-					root = append(root, &chainIDs)
-					for _, id := range chainIDs {
-						layers[id] = layers[id] + 1
-					}
+			if opts.SharedSize {
+				root = append(root, &chainIDs)
+				for _, id := range chainIDs {
+					layers[id] = layers[id] + 1
 				}
 			}
 
-			return nil, nil
-		}), img.Target)
-
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +139,7 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 	return summaries, nil
 }
 
-func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore content.Store, image containerd.Image) (*types.ImageSummary, []digest.Digest, error) {
+func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore content.Store, image *ImageManifest) (*types.ImageSummary, []digest.Digest, error) {
 	diffIDs, err := image.RootFS(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -197,16 +169,20 @@ func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore con
 		sizeCache[d] = usage.Size
 		return usage.Size, nil
 	}
-	virtualSize, err := computeVirtualSize(chainIDs, snapshotSizeFn)
+	snapshotSize, err := computeSnapshotSize(chainIDs, snapshotSizeFn)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// totalSize is the size of the image's packed layers and snapshots
+	// (unpacked layers) combined.
+	totalSize := size + snapshotSize
 
 	var repoTags, repoDigests []string
 	rawImg := image.Metadata()
 	target := rawImg.Target.Digest
 
-	logger := logrus.WithFields(logrus.Fields{
+	logger := log.G(ctx).WithFields(logrus.Fields{
 		"name":   rawImg.Name,
 		"digest": target,
 	})
@@ -239,8 +215,7 @@ func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore con
 		Created:     rawImg.CreatedAt.Unix(),
 		RepoDigests: repoDigests,
 		RepoTags:    repoTags,
-		Size:        size,
-		VirtualSize: virtualSize,
+		Size:        totalSize,
 		// -1 indicates that the value has not been set (avoids ambiguity
 		// between 0 (default) and "not set". We cannot use a pointer (nil)
 		// for this, as the JSON representation uses "omitempty", which would
@@ -256,8 +231,10 @@ type imageFilterFunc func(image images.Image) bool
 
 // setupFilters constructs an imageFilterFunc from the given imageFilters.
 //
+// containerdListFilters is a slice of filters which should be passed to ImageService.List()
+// filterFunc is a function that checks whether given image matches the filters.
 // TODO(thaJeztah): reimplement filters using containerd filters: see https://github.com/moby/moby/issues/43845
-func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Args) ([]string, imageFilterFunc, error) {
+func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Args) (containerdListFilters []string, filterFunc imageFilterFunc, outErr error) {
 	var fltrs []imageFilterFunc
 	err := imageFilters.WalkValues("before", func(value string) error {
 		ref, err := reference.ParseDockerRef(value)
@@ -297,10 +274,33 @@ func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Ar
 		return nil, nil, err
 	}
 
-	if imageFilters.Contains("label") {
+	err = imageFilters.WalkValues("until", func(value string) error {
+		ts, err := timetypes.GetTimestamp(value, time.Now())
+		if err != nil {
+			return err
+		}
+		seconds, nanoseconds, err := timetypes.ParseTimestamps(ts, 0)
+		if err != nil {
+			return err
+		}
+		until := time.Unix(seconds, nanoseconds)
+
 		fltrs = append(fltrs, func(image images.Image) bool {
-			return imageFilters.MatchKVList("label", image.Labels)
+			created := image.CreatedAt
+			return created.Before(until)
 		})
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	labelFn, err := setupLabelFilter(i.client.ContentStore(), imageFilters)
+	if err != nil {
+		return nil, nil, err
+	}
+	if labelFn != nil {
+		fltrs = append(fltrs, labelFn)
 	}
 
 	if imageFilters.Contains("dangling") {
@@ -337,16 +337,124 @@ func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Ar
 	}, nil
 }
 
-func computeVirtualSize(chainIDs []digest.Digest, sizeFn func(d digest.Digest) (int64, error)) (int64, error) {
-	var virtualSize int64
+// setupLabelFilter parses filter args for "label" and "label!" and returns a
+// filter func which will check if any image config from the given image has
+// labels that match given predicates.
+func setupLabelFilter(store content.Store, fltrs filters.Args) (func(image images.Image) bool, error) {
+	type labelCheck struct {
+		key        string
+		value      string
+		onlyExists bool
+		negate     bool
+	}
+
+	var checks []labelCheck
+	for _, fltrName := range []string{"label", "label!"} {
+		for _, l := range fltrs.Get(fltrName) {
+			k, v, found := strings.Cut(l, "=")
+			err := labels.Validate(k, v)
+			if err != nil {
+				return nil, err
+			}
+
+			negate := strings.HasSuffix(fltrName, "!")
+
+			// If filter value is key!=value then flip the above.
+			if strings.HasSuffix(k, "!") {
+				k = strings.TrimSuffix(k, "!")
+				negate = !negate
+			}
+
+			checks = append(checks, labelCheck{
+				key:        k,
+				value:      v,
+				onlyExists: !found,
+				negate:     negate,
+			})
+		}
+	}
+
+	return func(image images.Image) bool {
+		ctx := context.TODO()
+
+		// This is not an error, but a signal to Dispatch that it should stop
+		// processing more content (otherwise it will run for all children).
+		// It will be returned once a matching config is found.
+		errFoundConfig := errors.New("success, found matching config")
+		err := images.Dispatch(ctx, presentChildrenHandler(store, images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) (subdescs []ocispec.Descriptor, err error) {
+			if !images.IsConfigType(desc.MediaType) {
+				return nil, nil
+			}
+			// Subset of ocispec.Image that only contains Labels
+			var cfg struct {
+				Config struct {
+					Labels map[string]string `json:"Labels,omitempty"`
+				} `json:"Config,omitempty"`
+			}
+			if err := readConfig(ctx, store, desc, &cfg); err != nil {
+				return nil, err
+			}
+
+			for _, check := range checks {
+				value, exists := cfg.Config.Labels[check.key]
+
+				if check.onlyExists {
+					// label! given without value, check if doesn't exist
+					if check.negate {
+						// Label exists, config doesn't match
+						if exists {
+							return nil, nil
+						}
+					} else {
+						// Label should exist
+						if !exists {
+							// Label doesn't exist, config doesn't match
+							return nil, nil
+						}
+					}
+					continue
+				} else if !exists {
+					// We are checking value and label doesn't exist.
+					return nil, nil
+				}
+
+				valueEquals := value == check.value
+				if valueEquals == check.negate {
+					return nil, nil
+				}
+			}
+
+			// This config matches the filter so we need to shop this image, stop dispatch.
+			return nil, errFoundConfig
+		})), nil, image.Target)
+
+		if err == errFoundConfig {
+			return true
+		}
+		if err != nil {
+			log.G(ctx).WithFields(logrus.Fields{
+				logrus.ErrorKey: err,
+				"image":         image.Name,
+				"checks":        checks,
+			}).Error("failed to check image labels")
+		}
+
+		return false
+	}, nil
+}
+
+// computeSnapshotSize calculates the total size consumed by the snapshots
+// for the given chainIDs.
+func computeSnapshotSize(chainIDs []digest.Digest, sizeFn func(d digest.Digest) (int64, error)) (int64, error) {
+	var totalSize int64
 	for _, chainID := range chainIDs {
 		size, err := sizeFn(chainID)
 		if err != nil {
-			return virtualSize, err
+			return totalSize, err
 		}
-		virtualSize += size
+		totalSize += size
 	}
-	return virtualSize, nil
+	return totalSize, nil
 }
 
 func computeSharedSize(chainIDs []digest.Digest, layers map[digest.Digest]int, sizeFn func(d digest.Digest) (int64, error)) (int64, error) {
@@ -364,35 +472,8 @@ func computeSharedSize(chainIDs []digest.Digest, layers map[digest.Digest]int, s
 	return sharedSize, nil
 }
 
-// getManifestPlatform returns a platform specified by the manifest descriptor
-// or reads it from its config.
-func getManifestPlatform(ctx context.Context, store content.Provider, manifestDesc, configDesc v1.Descriptor) (v1.Platform, error) {
-	var platform v1.Platform
-	if manifestDesc.Platform != nil {
-		platform = *manifestDesc.Platform
-	} else {
-		// Config is technically a v1.Image, but it has the same member as v1.Platform
-		// which makes the v1.Platform a subset of Image so we can unmarshal directly.
-		if err := readConfig(ctx, store, configDesc, &platform); err != nil {
-			return platform, err
-		}
-	}
-	return platforms.Normalize(platform), nil
-}
-
-// isImageManifests returns true if the manifest has any layer that is a known image layer.
-// Some manifests use the image media type for compatibility, even if they are not a real image.
-func isImageManifest(mfst v1.Manifest) bool {
-	for _, l := range mfst.Layers {
-		if images.IsLayerType(l.MediaType) {
-			return true
-		}
-	}
-	return false
-}
-
 // readConfig reads content pointed by the descriptor and unmarshals it into a specified output.
-func readConfig(ctx context.Context, store content.Provider, desc v1.Descriptor, out interface{}) error {
+func readConfig(ctx context.Context, store content.Provider, desc ocispec.Descriptor, out interface{}) error {
 	data, err := content.ReadBlob(ctx, store, desc)
 	if err != nil {
 		return errors.Wrapf(err, "failed to read config content")

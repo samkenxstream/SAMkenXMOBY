@@ -59,7 +59,6 @@ test_env() {
 			DOCKER_HOST="$DOCKER_HOST" \
 			DOCKER_REMAP_ROOT="$DOCKER_REMAP_ROOT" \
 			DOCKER_REMOTE_DAEMON="$DOCKER_REMOTE_DAEMON" \
-			DOCKERFILE="$DOCKERFILE" \
 			GOPATH="$GOPATH" \
 			GOTRACEBACK=all \
 			HOME="$ABS_DEST/fake-HOME" \
@@ -81,5 +80,5 @@ set_platform_timeout() {
 	fi
 }
 
-sh /scripts/ensure-emptyfs.sh
+sh /scripts/build-empty-images.sh
 run_test_integration

@@ -1,6 +1,7 @@
 package dockerfile // import "github.com/docker/docker/builder/dockerfile"
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -25,7 +26,7 @@ func TestEmptyDockerfile(t *testing.T) {
 	contextDir, cleanup := createTestTempDir(t, "", "builder-dockerfile-test")
 	defer cleanup()
 
-	createTestTempFile(t, contextDir, builder.DefaultDockerfileName, "", 0777)
+	createTestTempFile(t, contextDir, builder.DefaultDockerfileName, "", 0o777)
 
 	readAndCheckDockerfile(t, "emptyDockerfile", contextDir, "", "the Dockerfile (Dockerfile) cannot be empty")
 }
@@ -95,7 +96,7 @@ func TestCopyRunConfig(t *testing.T) {
 	defaultEnv := []string{"foo=1"}
 	defaultCmd := []string{"old"}
 
-	var testcases = []struct {
+	testcases := []struct {
 		doc       string
 		modifiers []runConfigModifier
 		expected  *container.Config
@@ -193,6 +194,7 @@ type MockROLayer struct {
 	diffID layer.DiffID
 }
 
+func (l *MockROLayer) ContentStoreDigest() digest.Digest    { return "" }
 func (l *MockROLayer) Release() error                       { return nil }
 func (l *MockROLayer) NewRWLayer() (builder.RWLayer, error) { return nil, nil }
 func (l *MockROLayer) DiffID() layer.DiffID                 { return l.diffID }
@@ -217,6 +219,6 @@ func TestExportImage(t *testing.T) {
 		imageSources: getMockImageSource(nil, nil, nil),
 		docker:       getMockBuildBackend(),
 	}
-	err := b.exportImage(ds, layer, parentImage, runConfig)
+	err := b.exportImage(context.TODO(), ds, layer, parentImage, runConfig)
 	assert.NilError(t, err)
 }

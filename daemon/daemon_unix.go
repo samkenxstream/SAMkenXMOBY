@@ -1,5 +1,4 @@
 //go:build linux || freebsd
-// +build linux freebsd
 
 package daemon // import "github.com/docker/docker/daemon"
 
@@ -19,10 +18,8 @@ import (
 	"time"
 
 	"github.com/containerd/cgroups/v3"
-	statsV1 "github.com/containerd/cgroups/v3/cgroup1/stats"
-	statsV2 "github.com/containerd/cgroups/v3/cgroup2/stats"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/pkg/userns"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/blkiodev"
 	pblkiodev "github.com/docker/docker/api/types/blkiodev"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -49,7 +46,6 @@ import (
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -108,7 +104,10 @@ func getMemoryResources(config containertypes.Resources) *specs.LinuxMemory {
 		memory.KernelTCP = &config.KernelMemoryTCP
 	}
 
-	return &memory
+	if memory != (specs.LinuxMemory{}) {
+		return &memory
+	}
+	return nil
 }
 
 func getPidsLimit(config containertypes.Resources) *specs.LinuxPids {
@@ -130,7 +129,7 @@ func getCPUResources(config containertypes.Resources) (*specs.LinuxCPU, error) {
 	if config.CPUShares < 0 {
 		return nil, fmt.Errorf("shares: invalid argument")
 	}
-	if config.CPUShares >= 0 {
+	if config.CPUShares > 0 {
 		shares := uint64(config.CPUShares)
 		cpu.Shares = &shares
 	}
@@ -171,7 +170,10 @@ func getCPUResources(config containertypes.Resources) (*specs.LinuxCPU, error) {
 		cpu.RealtimeRuntime = &c
 	}
 
-	return &cpu, nil
+	if cpu != (specs.LinuxCPU{}) {
+		return &cpu, nil
+	}
+	return nil, nil
 }
 
 func getBlkioWeightDevices(config containertypes.Resources) ([]specs.LinuxWeightDevice, error) {
@@ -193,12 +195,12 @@ func getBlkioWeightDevices(config containertypes.Resources) ([]specs.LinuxWeight
 	return blkioWeightDevices, nil
 }
 
-func (daemon *Daemon) parseSecurityOpt(container *container.Container, hostConfig *containertypes.HostConfig) error {
-	container.NoNewPrivileges = daemon.configStore.NoNewPrivileges
-	return parseSecurityOpt(container, hostConfig)
+func (daemon *Daemon) parseSecurityOpt(cfg *config.Config, securityOptions *container.SecurityOptions, hostConfig *containertypes.HostConfig) error {
+	securityOptions.NoNewPrivileges = cfg.NoNewPrivileges
+	return parseSecurityOpt(securityOptions, hostConfig)
 }
 
-func parseSecurityOpt(container *container.Container, config *containertypes.HostConfig) error {
+func parseSecurityOpt(securityOptions *container.SecurityOptions, config *containertypes.HostConfig) error {
 	var (
 		labelOpts []string
 		err       error
@@ -206,7 +208,7 @@ func parseSecurityOpt(container *container.Container, config *containertypes.Hos
 
 	for _, opt := range config.SecurityOpt {
 		if opt == "no-new-privileges" {
-			container.NoNewPrivileges = true
+			securityOptions.NoNewPrivileges = true
 			continue
 		}
 		if opt == "disable" {
@@ -220,7 +222,7 @@ func parseSecurityOpt(container *container.Container, config *containertypes.Hos
 			k, v, ok = strings.Cut(opt, "=")
 		} else if strings.Contains(opt, ":") {
 			k, v, ok = strings.Cut(opt, ":")
-			logrus.Warn("Security options with `:` as a separator are deprecated and will be completely unsupported in 17.04, use `=` instead.")
+			log.G(context.TODO()).Warn("Security options with `:` as a separator are deprecated and will be completely unsupported in 17.04, use `=` instead.")
 		}
 		if !ok {
 			return fmt.Errorf("invalid --security-opt 1: %q", opt)
@@ -230,21 +232,21 @@ func parseSecurityOpt(container *container.Container, config *containertypes.Hos
 		case "label":
 			labelOpts = append(labelOpts, v)
 		case "apparmor":
-			container.AppArmorProfile = v
+			securityOptions.AppArmorProfile = v
 		case "seccomp":
-			container.SeccompProfile = v
+			securityOptions.SeccompProfile = v
 		case "no-new-privileges":
 			noNewPrivileges, err := strconv.ParseBool(v)
 			if err != nil {
 				return fmt.Errorf("invalid --security-opt 2: %q", opt)
 			}
-			container.NoNewPrivileges = noNewPrivileges
+			securityOptions.NoNewPrivileges = noNewPrivileges
 		default:
 			return fmt.Errorf("invalid --security-opt 2: %q", opt)
 		}
 	}
 
-	container.ProcessLabel, container.MountLabel, err = label.InitLabels(labelOpts)
+	securityOptions.ProcessLabel, securityOptions.MountLabel, err = label.InitLabels(labelOpts)
 	return err
 }
 
@@ -282,7 +284,7 @@ func adjustParallelLimit(n int, limit int) int {
 	// ulimits to the largest possible value for dockerd).
 	var rlim unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlim); err != nil {
-		logrus.Warnf("Couldn't find dockerd's RLIMIT_NOFILE to double-check startup parallelism factor: %v", err)
+		log.G(context.TODO()).Warnf("Couldn't find dockerd's RLIMIT_NOFILE to double-check startup parallelism factor: %v", err)
 		return limit
 	}
 	softRlimit := int(rlim.Cur)
@@ -297,20 +299,20 @@ func adjustParallelLimit(n int, limit int) int {
 		return limit
 	}
 
-	logrus.Warnf("Found dockerd's open file ulimit (%v) is far too small -- consider increasing it significantly (at least %v)", softRlimit, overhead*limit)
+	log.G(context.TODO()).Warnf("Found dockerd's open file ulimit (%v) is far too small -- consider increasing it significantly (at least %v)", softRlimit, overhead*limit)
 	return softRlimit / overhead
 }
 
 // adaptContainerSettings is called during container creation to modify any
 // settings necessary in the HostConfig structure.
-func (daemon *Daemon) adaptContainerSettings(hostConfig *containertypes.HostConfig, adjustCPUShares bool) error {
+func (daemon *Daemon) adaptContainerSettings(daemonCfg *config.Config, hostConfig *containertypes.HostConfig, adjustCPUShares bool) error {
 	if adjustCPUShares && hostConfig.CPUShares > 0 {
 		// Handle unsupported CPUShares
 		if hostConfig.CPUShares < linuxMinCPUShares {
-			logrus.Warnf("Changing requested CPUShares of %d to minimum allowed of %d", hostConfig.CPUShares, linuxMinCPUShares)
+			log.G(context.TODO()).Warnf("Changing requested CPUShares of %d to minimum allowed of %d", hostConfig.CPUShares, linuxMinCPUShares)
 			hostConfig.CPUShares = linuxMinCPUShares
 		} else if hostConfig.CPUShares > linuxMaxCPUShares {
-			logrus.Warnf("Changing requested CPUShares of %d to maximum allowed of %d", hostConfig.CPUShares, linuxMaxCPUShares)
+			log.G(context.TODO()).Warnf("Changing requested CPUShares of %d to maximum allowed of %d", hostConfig.CPUShares, linuxMaxCPUShares)
 			hostConfig.CPUShares = linuxMaxCPUShares
 		}
 	}
@@ -320,15 +322,15 @@ func (daemon *Daemon) adaptContainerSettings(hostConfig *containertypes.HostConf
 	}
 	if hostConfig.ShmSize == 0 {
 		hostConfig.ShmSize = config.DefaultShmSize
-		if daemon.configStore != nil {
-			hostConfig.ShmSize = int64(daemon.configStore.ShmSize)
+		if daemonCfg != nil {
+			hostConfig.ShmSize = int64(daemonCfg.ShmSize)
 		}
 	}
 	// Set default IPC mode, if unset for container
 	if hostConfig.IpcMode.IsEmpty() {
 		m := config.DefaultIpcMode
-		if daemon.configStore != nil {
-			m = containertypes.IpcMode(daemon.configStore.IpcMode)
+		if daemonCfg != nil {
+			m = containertypes.IpcMode(daemonCfg.IpcMode)
 		}
 		hostConfig.IpcMode = m
 	}
@@ -344,8 +346,8 @@ func (daemon *Daemon) adaptContainerSettings(hostConfig *containertypes.HostConf
 			if cgroups.Mode() == cgroups.Unified {
 				m = containertypes.CgroupnsModePrivate
 			}
-			if daemon.configStore != nil {
-				m = containertypes.CgroupnsMode(daemon.configStore.CgroupNamespaceMode)
+			if daemonCfg != nil {
+				m = containertypes.CgroupnsMode(daemonCfg.CgroupNamespaceMode)
 			}
 			hostConfig.CgroupnsMode = m
 		}
@@ -570,11 +572,11 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 	return warnings, nil
 }
 
-func (daemon *Daemon) getCgroupDriver() string {
-	if UsingSystemd(daemon.configStore) {
+func cgroupDriver(cfg *config.Config) string {
+	if UsingSystemd(cfg) {
 		return cgroupSystemdDriver
 	}
-	if daemon.Rootless() {
+	if cfg.Rootless {
 		return cgroupNoneDriver
 	}
 	return cgroupFsDriver
@@ -643,7 +645,7 @@ func isRunningSystemd() bool {
 
 // verifyPlatformContainerSettings performs platform-specific validation of the
 // hostconfig and config structures.
-func verifyPlatformContainerSettings(daemon *Daemon, hostConfig *containertypes.HostConfig, update bool) (warnings []string, err error) {
+func verifyPlatformContainerSettings(daemon *Daemon, daemonCfg *configStore, hostConfig *containertypes.HostConfig, update bool) (warnings []string, err error) {
 	if hostConfig == nil {
 		return nil, nil
 	}
@@ -684,7 +686,7 @@ func verifyPlatformContainerSettings(daemon *Daemon, hostConfig *containertypes.
 	}
 
 	// check for various conflicting options with user namespaces
-	if daemon.configStore.RemappedRoot != "" && hostConfig.UsernsMode.IsPrivate() {
+	if daemonCfg.RemappedRoot != "" && hostConfig.UsernsMode.IsPrivate() {
 		if hostConfig.Privileged {
 			return warnings, fmt.Errorf("privileged mode is incompatible with user namespaces.  You must run the container in the host namespace when running privileged mode")
 		}
@@ -695,17 +697,17 @@ func verifyPlatformContainerSettings(daemon *Daemon, hostConfig *containertypes.
 			return warnings, fmt.Errorf("cannot share the host PID namespace when user namespaces are enabled")
 		}
 	}
-	if hostConfig.CgroupParent != "" && UsingSystemd(daemon.configStore) {
+	if hostConfig.CgroupParent != "" && UsingSystemd(&daemonCfg.Config) {
 		// CgroupParent for systemd cgroup should be named as "xxx.slice"
 		if len(hostConfig.CgroupParent) <= 6 || !strings.HasSuffix(hostConfig.CgroupParent, ".slice") {
-			return warnings, fmt.Errorf("cgroup-parent for systemd cgroup should be a valid slice named as \"xxx.slice\"")
+			return warnings, fmt.Errorf(`cgroup-parent for systemd cgroup should be a valid slice named as "xxx.slice"`)
 		}
 	}
 	if hostConfig.Runtime == "" {
-		hostConfig.Runtime = daemon.configStore.GetDefaultRuntimeName()
+		hostConfig.Runtime = daemonCfg.Runtimes.Default
 	}
 
-	if _, _, err := daemon.getRuntime(hostConfig.Runtime); err != nil {
+	if _, _, err := daemonCfg.Runtimes.Get(hostConfig.Runtime); err != nil {
 		return warnings, err
 	}
 
@@ -751,21 +753,12 @@ func verifyDaemonSettings(conf *config.Config) error {
 	}
 	if conf.CgroupParent != "" && UsingSystemd(conf) {
 		if len(conf.CgroupParent) <= 6 || !strings.HasSuffix(conf.CgroupParent, ".slice") {
-			return fmt.Errorf("cgroup-parent for systemd cgroup should be a valid slice named as \"xxx.slice\"")
+			return fmt.Errorf(`cgroup-parent for systemd cgroup should be a valid slice named as "xxx.slice"`)
 		}
 	}
 
 	if conf.Rootless && UsingSystemd(conf) && cgroups.Mode() != cgroups.Unified {
 		return fmt.Errorf("exec-opt native.cgroupdriver=systemd requires cgroup v2 for rootless mode")
-	}
-
-	configureRuntimes(conf)
-	if rtName := conf.GetDefaultRuntimeName(); rtName != "" {
-		if conf.GetRuntime(rtName) == nil {
-			if !config.IsPermissibleC8dRuntimeName(rtName) {
-				return fmt.Errorf("specified default runtime '%s' does not exist", rtName)
-			}
-		}
 	}
 	return nil
 }
@@ -788,7 +781,7 @@ func configureMaxThreads(config *config.Config) error {
 	}
 	maxThreads := (mtint / 100) * 90
 	debug.SetMaxThreads(maxThreads)
-	logrus.Debugf("Golang's threads limit set to %d", maxThreads)
+	log.G(context.TODO()).Debugf("Golang's threads limit set to %d", maxThreads)
 	return nil
 }
 
@@ -816,12 +809,12 @@ func overlaySupportsSelinux() (bool, error) {
 func configureKernelSecuritySupport(config *config.Config, driverName string) error {
 	if config.EnableSelinuxSupport {
 		if !selinux.GetEnabled() {
-			logrus.Warn("Docker could not enable SELinux on the host system")
+			log.G(context.TODO()).Warn("Docker could not enable SELinux on the host system")
 			return nil
 		}
 
-		if driverName == "overlay" || driverName == "overlay2" || driverName == "overlayfs" {
-			// If driver is overlay or overlay2, make sure kernel
+		if driverName == "overlay2" || driverName == "overlayfs" {
+			// If driver is overlay2, make sure kernel
 			// supports selinux with overlay.
 			supported, err := overlaySupportsSelinux()
 			if err != nil {
@@ -829,7 +822,7 @@ func configureKernelSecuritySupport(config *config.Config, driverName string) er
 			}
 
 			if !supported {
-				logrus.Warnf("SELinux is not supported with the %v graph driver on this kernel", driverName)
+				log.G(context.TODO()).Warnf("SELinux is not supported with the %v graph driver on this kernel", driverName)
 			}
 		}
 	} else {
@@ -841,8 +834,8 @@ func configureKernelSecuritySupport(config *config.Config, driverName string) er
 // initNetworkController initializes the libnetwork controller and configures
 // network settings. If there's active sandboxes, configuration changes will not
 // take effect.
-func (daemon *Daemon) initNetworkController(activeSandboxes map[string]interface{}) error {
-	netOptions, err := daemon.networkOptions(daemon.PluginStore, activeSandboxes)
+func (daemon *Daemon) initNetworkController(cfg *config.Config, activeSandboxes map[string]interface{}) error {
+	netOptions, err := daemon.networkOptions(cfg, daemon.PluginStore, activeSandboxes)
 	if err != nil {
 		return err
 	}
@@ -853,13 +846,13 @@ func (daemon *Daemon) initNetworkController(activeSandboxes map[string]interface
 	}
 
 	if len(activeSandboxes) > 0 {
-		logrus.Info("there are running containers, updated network configuration will not take affect")
-	} else if err := configureNetworking(daemon.netController, daemon.configStore); err != nil {
+		log.G(context.TODO()).Info("there are running containers, updated network configuration will not take affect")
+	} else if err := configureNetworking(daemon.netController, cfg); err != nil {
 		return err
 	}
 
 	// Set HostGatewayIP to the default bridge's IP if it is empty
-	setHostGatewayIP(daemon.netController, daemon.configStore)
+	setHostGatewayIP(daemon.netController, cfg)
 	return nil
 }
 
@@ -890,7 +883,7 @@ func configureNetworking(controller *libnetwork.Controller, conf *config.Config)
 
 	if !conf.DisableBridge {
 		// Initialize default driver "bridge"
-		if err := initBridgeDriver(controller, conf); err != nil {
+		if err := initBridgeDriver(controller, conf.BridgeConfig); err != nil {
 			return err
 		}
 	} else {
@@ -929,22 +922,22 @@ func driverOptions(config *config.Config) nwconfig.Option {
 	})
 }
 
-func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) error {
+func initBridgeDriver(controller *libnetwork.Controller, cfg config.BridgeConfig) error {
 	bridgeName := bridge.DefaultBridgeName
-	if config.BridgeConfig.Iface != "" {
-		bridgeName = config.BridgeConfig.Iface
+	if cfg.Iface != "" {
+		bridgeName = cfg.Iface
 	}
 	netOption := map[string]string{
 		bridge.BridgeName:         bridgeName,
 		bridge.DefaultBridge:      strconv.FormatBool(true),
-		netlabel.DriverMTU:        strconv.Itoa(config.Mtu),
-		bridge.EnableIPMasquerade: strconv.FormatBool(config.BridgeConfig.EnableIPMasq),
-		bridge.EnableICC:          strconv.FormatBool(config.BridgeConfig.InterContainerCommunication),
+		netlabel.DriverMTU:        strconv.Itoa(cfg.MTU),
+		bridge.EnableIPMasquerade: strconv.FormatBool(cfg.EnableIPMasq),
+		bridge.EnableICC:          strconv.FormatBool(cfg.InterContainerCommunication),
 	}
 
 	// --ip processing
-	if config.BridgeConfig.DefaultIP != nil {
-		netOption[bridge.DefaultBindingIP] = config.BridgeConfig.DefaultIP.String()
+	if cfg.DefaultIP != nil {
+		netOption[bridge.DefaultBindingIP] = cfg.DefaultIP.String()
 	}
 
 	ipamV4Conf := &libnetwork.IpamConf{AuxAddresses: make(map[string]string)}
@@ -961,8 +954,8 @@ func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) 
 
 	if len(nwList) > 0 {
 		nw := nwList[0]
-		if len(nwList) > 1 && config.BridgeConfig.FixedCIDR != "" {
-			_, fCIDR, err := net.ParseCIDR(config.BridgeConfig.FixedCIDR)
+		if len(nwList) > 1 && cfg.FixedCIDR != "" {
+			_, fCIDR, err := net.ParseCIDR(cfg.FixedCIDR)
 			if err != nil {
 				return errors.Wrap(err, "parse CIDR failed")
 			}
@@ -982,28 +975,31 @@ func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) 
 		}
 	}
 
-	if config.BridgeConfig.IP != "" {
-		ip, ipNet, err := net.ParseCIDR(config.BridgeConfig.IP)
+	if cfg.IP != "" {
+		ip, ipNet, err := net.ParseCIDR(cfg.IP)
 		if err != nil {
 			return err
 		}
 		ipamV4Conf.PreferredPool = ipNet.String()
 		ipamV4Conf.Gateway = ip.String()
 	} else if bridgeName == bridge.DefaultBridgeName && ipamV4Conf.PreferredPool != "" {
-		logrus.Infof("Default bridge (%s) is assigned with an IP address %s. Daemon option --bip can be used to set a preferred IP address", bridgeName, ipamV4Conf.PreferredPool)
+		log.G(context.TODO()).Infof("Default bridge (%s) is assigned with an IP address %s. Daemon option --bip can be used to set a preferred IP address", bridgeName, ipamV4Conf.PreferredPool)
 	}
 
-	if config.BridgeConfig.FixedCIDR != "" {
-		_, fCIDR, err := net.ParseCIDR(config.BridgeConfig.FixedCIDR)
+	if cfg.FixedCIDR != "" {
+		_, fCIDR, err := net.ParseCIDR(cfg.FixedCIDR)
 		if err != nil {
 			return err
 		}
 
 		ipamV4Conf.SubPool = fCIDR.String()
+		if ipamV4Conf.PreferredPool == "" {
+			ipamV4Conf.PreferredPool = fCIDR.String()
+		}
 	}
 
-	if config.BridgeConfig.DefaultGatewayIPv4 != nil {
-		ipamV4Conf.AuxAddresses["DefaultGatewayIPv4"] = config.BridgeConfig.DefaultGatewayIPv4.String()
+	if cfg.DefaultGatewayIPv4 != nil {
+		ipamV4Conf.AuxAddresses["DefaultGatewayIPv4"] = cfg.DefaultGatewayIPv4.String()
 	}
 
 	var (
@@ -1011,10 +1007,10 @@ func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) 
 		ipamV6Conf     *libnetwork.IpamConf
 	)
 
-	if config.BridgeConfig.EnableIPv6 && config.BridgeConfig.FixedCIDRv6 == "" {
+	if cfg.EnableIPv6 && cfg.FixedCIDRv6 == "" {
 		return errdefs.InvalidParameter(errors.New("IPv6 is enabled for the default bridge, but no subnet is configured. Specify an IPv6 subnet using --fixed-cidr-v6"))
-	} else if config.BridgeConfig.FixedCIDRv6 != "" {
-		_, fCIDRv6, err := net.ParseCIDR(config.BridgeConfig.FixedCIDRv6)
+	} else if cfg.FixedCIDRv6 != "" {
+		_, fCIDRv6, err := net.ParseCIDR(cfg.FixedCIDRv6)
 		if err != nil {
 			return err
 		}
@@ -1044,11 +1040,11 @@ func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) 
 		}
 	}
 
-	if config.BridgeConfig.DefaultGatewayIPv6 != nil {
+	if cfg.DefaultGatewayIPv6 != nil {
 		if ipamV6Conf == nil {
 			ipamV6Conf = &libnetwork.IpamConf{AuxAddresses: make(map[string]string)}
 		}
-		ipamV6Conf.AuxAddresses["DefaultGatewayIPv6"] = config.BridgeConfig.DefaultGatewayIPv6.String()
+		ipamV6Conf.AuxAddresses["DefaultGatewayIPv6"] = cfg.DefaultGatewayIPv6.String()
 	}
 
 	v4Conf := []*libnetwork.IpamConf{ipamV4Conf}
@@ -1058,12 +1054,12 @@ func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) 
 	}
 	// Initialize default network on "bridge" with the same name
 	_, err = controller.NewNetwork("bridge", "bridge", "",
-		libnetwork.NetworkOptionEnableIPv6(config.BridgeConfig.EnableIPv6),
+		libnetwork.NetworkOptionEnableIPv6(cfg.EnableIPv6),
 		libnetwork.NetworkOptionDriverOpts(netOption),
 		libnetwork.NetworkOptionIpam("default", "", v4Conf, v6Conf, nil),
 		libnetwork.NetworkOptionDeferIPv6Alloc(deferIPv6Alloc))
 	if err != nil {
-		return fmt.Errorf("Error creating default \"bridge\" network: %v", err)
+		return fmt.Errorf(`error creating default "bridge" network: %v`, err)
 	}
 	return nil
 }
@@ -1072,7 +1068,7 @@ func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) 
 func removeDefaultBridgeInterface() {
 	if lnk, err := netlink.LinkByName(bridge.DefaultBridgeName); err == nil {
 		if err := netlink.LinkDel(lnk); err != nil {
-			logrus.Warnf("Failed to remove bridge interface (%s): %v", bridge.DefaultBridgeName, err)
+			log.G(context.TODO()).Warnf("Failed to remove bridge interface (%s): %v", bridge.DefaultBridgeName, err)
 		}
 	}
 }
@@ -1191,10 +1187,10 @@ func setupRemappedRoot(config *config.Config) (idtools.IdentityMapping, error) {
 		if username == "root" {
 			// Cannot setup user namespaces with a 1-to-1 mapping; "--root=0:0" is a no-op
 			// effectively
-			logrus.Warn("User namespaces: root cannot be remapped with itself; user namespaces are OFF")
+			log.G(context.TODO()).Warn("User namespaces: root cannot be remapped with itself; user namespaces are OFF")
 			return idtools.IdentityMapping{}, nil
 		}
-		logrus.Infof("User namespaces: ID ranges will be mapped to subuid/subgid ranges of: %s", username)
+		log.G(context.TODO()).Infof("User namespaces: ID ranges will be mapped to subuid/subgid ranges of: %s", username)
 		// update remapped root setting now that we have resolved them to actual names
 		config.RemappedRoot = fmt.Sprintf("%s:%s", username, groupname)
 
@@ -1217,19 +1213,19 @@ func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools
 	// layer content subtrees.
 	if _, err := os.Stat(rootDir); err == nil {
 		// root current exists; verify the access bits are correct by setting them
-		if err = os.Chmod(rootDir, 0711); err != nil {
+		if err = os.Chmod(rootDir, 0o711); err != nil {
 			return err
 		}
 	} else if os.IsNotExist(err) {
 		// no root exists yet, create it 0711 with root:root ownership
-		if err := os.MkdirAll(rootDir, 0711); err != nil {
+		if err := os.MkdirAll(rootDir, 0o711); err != nil {
 			return err
 		}
 	}
 
 	id := idtools.Identity{UID: idtools.CurrentIdentity().UID, GID: remappedRoot.GID}
 	// First make sure the current root dir has the correct perms.
-	if err := idtools.MkdirAllAndChown(config.Root, 0710, id); err != nil {
+	if err := idtools.MkdirAllAndChown(config.Root, 0o710, id); err != nil {
 		return errors.Wrapf(err, "could not create or set daemon root permissions: %s", config.Root)
 	}
 
@@ -1239,9 +1235,9 @@ func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools
 	// `chdir()` to work for containers namespaced to that uid/gid)
 	if config.RemappedRoot != "" {
 		config.Root = filepath.Join(rootDir, fmt.Sprintf("%d.%d", remappedRoot.UID, remappedRoot.GID))
-		logrus.Debugf("Creating user namespaced daemon root: %s", config.Root)
+		log.G(context.TODO()).Debugf("Creating user namespaced daemon root: %s", config.Root)
 		// Create the root directory if it doesn't exist
-		if err := idtools.MkdirAllAndChown(config.Root, 0710, id); err != nil {
+		if err := idtools.MkdirAllAndChown(config.Root, 0o710, id); err != nil {
 			return fmt.Errorf("Cannot create daemon root: %s: %v", config.Root, err)
 		}
 		// we also need to verify that any pre-existing directories in the path to
@@ -1261,7 +1257,7 @@ func setupDaemonRoot(config *config.Config, rootDir string, remappedRoot idtools
 	}
 
 	if err := setupDaemonRootPropagation(config); err != nil {
-		logrus.WithError(err).WithField("dir", config.Root).Warn("Error while setting daemon root propagation, this is not generally critical but may cause some functionality to not work or fallback to less desirable behavior")
+		log.G(context.TODO()).WithError(err).WithField("dir", config.Root).Warn("Error while setting daemon root propagation, this is not generally critical but may cause some functionality to not work or fallback to less desirable behavior")
 	}
 	return nil
 }
@@ -1307,7 +1303,7 @@ func setupDaemonRootPropagation(cfg *config.Config) error {
 			return
 		}
 		if err := os.Remove(cleanupFile); err != nil && !os.IsNotExist(err) {
-			logrus.WithError(err).WithField("file", cleanupFile).Warn("could not clean up old root propagation unmount file")
+			log.G(context.TODO()).WithError(err).WithField("file", cleanupFile).Warn("could not clean up old root propagation unmount file")
 		}
 	}()
 
@@ -1327,11 +1323,11 @@ func setupDaemonRootPropagation(cfg *config.Config) error {
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(cleanupFile), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cleanupFile), 0o700); err != nil {
 		return errors.Wrap(err, "error creating dir to store mount cleanup file")
 	}
 
-	if err := os.WriteFile(cleanupFile, nil, 0600); err != nil {
+	if err := os.WriteFile(cleanupFile, nil, 0o600); err != nil {
 		return errors.Wrap(err, "error writing file to signal mount cleanup on shutdown")
 	}
 	return nil
@@ -1394,272 +1390,18 @@ func (daemon *Daemon) registerLinks(container *container.Container, hostConfig *
 // conditionalMountOnStart is a platform specific helper function during the
 // container start to call mount.
 func (daemon *Daemon) conditionalMountOnStart(container *container.Container) error {
-	if !daemon.UsesSnapshotter() {
-		return daemon.Mount(container)
-	}
-	return nil
+	return daemon.Mount(container)
 }
 
 // conditionalUnmountOnCleanup is a platform specific helper function called
 // during the cleanup of a container to unmount.
 func (daemon *Daemon) conditionalUnmountOnCleanup(container *container.Container) error {
-	if !daemon.UsesSnapshotter() {
-		return daemon.Unmount(container)
-	}
-	return nil
-}
-
-func copyBlkioEntry(entries []*statsV1.BlkIOEntry) []types.BlkioStatEntry {
-	out := make([]types.BlkioStatEntry, len(entries))
-	for i, re := range entries {
-		out[i] = types.BlkioStatEntry{
-			Major: re.Major,
-			Minor: re.Minor,
-			Op:    re.Op,
-			Value: re.Value,
-		}
-	}
-	return out
-}
-
-func (daemon *Daemon) stats(c *container.Container) (*types.StatsJSON, error) {
-	c.Lock()
-	task, err := c.GetRunningTask()
-	c.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	cs, err := task.Stats(context.Background())
-	if err != nil {
-		if strings.Contains(err.Error(), "container not found") {
-			return nil, containerNotFound(c.ID)
-		}
-		return nil, err
-	}
-	s := &types.StatsJSON{}
-	s.Read = cs.Read
-	stats := cs.Metrics
-	switch t := stats.(type) {
-	case *statsV1.Metrics:
-		return daemon.statsV1(s, t)
-	case *statsV2.Metrics:
-		return daemon.statsV2(s, t)
-	default:
-		return nil, errors.Errorf("unexpected type of metrics %+v", t)
-	}
-}
-
-func (daemon *Daemon) statsV1(s *types.StatsJSON, stats *statsV1.Metrics) (*types.StatsJSON, error) {
-	if stats.Blkio != nil {
-		s.BlkioStats = types.BlkioStats{
-			IoServiceBytesRecursive: copyBlkioEntry(stats.Blkio.IoServiceBytesRecursive),
-			IoServicedRecursive:     copyBlkioEntry(stats.Blkio.IoServicedRecursive),
-			IoQueuedRecursive:       copyBlkioEntry(stats.Blkio.IoQueuedRecursive),
-			IoServiceTimeRecursive:  copyBlkioEntry(stats.Blkio.IoServiceTimeRecursive),
-			IoWaitTimeRecursive:     copyBlkioEntry(stats.Blkio.IoWaitTimeRecursive),
-			IoMergedRecursive:       copyBlkioEntry(stats.Blkio.IoMergedRecursive),
-			IoTimeRecursive:         copyBlkioEntry(stats.Blkio.IoTimeRecursive),
-			SectorsRecursive:        copyBlkioEntry(stats.Blkio.SectorsRecursive),
-		}
-	}
-	if stats.CPU != nil {
-		s.CPUStats = types.CPUStats{
-			CPUUsage: types.CPUUsage{
-				TotalUsage:        stats.CPU.Usage.Total,
-				PercpuUsage:       stats.CPU.Usage.PerCPU,
-				UsageInKernelmode: stats.CPU.Usage.Kernel,
-				UsageInUsermode:   stats.CPU.Usage.User,
-			},
-			ThrottlingData: types.ThrottlingData{
-				Periods:          stats.CPU.Throttling.Periods,
-				ThrottledPeriods: stats.CPU.Throttling.ThrottledPeriods,
-				ThrottledTime:    stats.CPU.Throttling.ThrottledTime,
-			},
-		}
-	}
-
-	if stats.Memory != nil {
-		raw := map[string]uint64{
-			"cache":                     stats.Memory.Cache,
-			"rss":                       stats.Memory.RSS,
-			"rss_huge":                  stats.Memory.RSSHuge,
-			"mapped_file":               stats.Memory.MappedFile,
-			"dirty":                     stats.Memory.Dirty,
-			"writeback":                 stats.Memory.Writeback,
-			"pgpgin":                    stats.Memory.PgPgIn,
-			"pgpgout":                   stats.Memory.PgPgOut,
-			"pgfault":                   stats.Memory.PgFault,
-			"pgmajfault":                stats.Memory.PgMajFault,
-			"inactive_anon":             stats.Memory.InactiveAnon,
-			"active_anon":               stats.Memory.ActiveAnon,
-			"inactive_file":             stats.Memory.InactiveFile,
-			"active_file":               stats.Memory.ActiveFile,
-			"unevictable":               stats.Memory.Unevictable,
-			"hierarchical_memory_limit": stats.Memory.HierarchicalMemoryLimit,
-			"hierarchical_memsw_limit":  stats.Memory.HierarchicalSwapLimit,
-			"total_cache":               stats.Memory.TotalCache,
-			"total_rss":                 stats.Memory.TotalRSS,
-			"total_rss_huge":            stats.Memory.TotalRSSHuge,
-			"total_mapped_file":         stats.Memory.TotalMappedFile,
-			"total_dirty":               stats.Memory.TotalDirty,
-			"total_writeback":           stats.Memory.TotalWriteback,
-			"total_pgpgin":              stats.Memory.TotalPgPgIn,
-			"total_pgpgout":             stats.Memory.TotalPgPgOut,
-			"total_pgfault":             stats.Memory.TotalPgFault,
-			"total_pgmajfault":          stats.Memory.TotalPgMajFault,
-			"total_inactive_anon":       stats.Memory.TotalInactiveAnon,
-			"total_active_anon":         stats.Memory.TotalActiveAnon,
-			"total_inactive_file":       stats.Memory.TotalInactiveFile,
-			"total_active_file":         stats.Memory.TotalActiveFile,
-			"total_unevictable":         stats.Memory.TotalUnevictable,
-		}
-		if stats.Memory.Usage != nil {
-			s.MemoryStats = types.MemoryStats{
-				Stats:    raw,
-				Usage:    stats.Memory.Usage.Usage,
-				MaxUsage: stats.Memory.Usage.Max,
-				Limit:    stats.Memory.Usage.Limit,
-				Failcnt:  stats.Memory.Usage.Failcnt,
-			}
-		} else {
-			s.MemoryStats = types.MemoryStats{
-				Stats: raw,
-			}
-		}
-
-		// if the container does not set memory limit, use the machineMemory
-		if s.MemoryStats.Limit > daemon.machineMemory && daemon.machineMemory > 0 {
-			s.MemoryStats.Limit = daemon.machineMemory
-		}
-	}
-
-	if stats.Pids != nil {
-		s.PidsStats = types.PidsStats{
-			Current: stats.Pids.Current,
-			Limit:   stats.Pids.Limit,
-		}
-	}
-
-	return s, nil
-}
-
-func (daemon *Daemon) statsV2(s *types.StatsJSON, stats *statsV2.Metrics) (*types.StatsJSON, error) {
-	if stats.Io != nil {
-		var isbr []types.BlkioStatEntry
-		for _, re := range stats.Io.Usage {
-			isbr = append(isbr,
-				types.BlkioStatEntry{
-					Major: re.Major,
-					Minor: re.Minor,
-					Op:    "read",
-					Value: re.Rbytes,
-				},
-				types.BlkioStatEntry{
-					Major: re.Major,
-					Minor: re.Minor,
-					Op:    "write",
-					Value: re.Wbytes,
-				},
-			)
-		}
-		s.BlkioStats = types.BlkioStats{
-			IoServiceBytesRecursive: isbr,
-			// Other fields are unsupported
-		}
-	}
-
-	if stats.CPU != nil {
-		s.CPUStats = types.CPUStats{
-			CPUUsage: types.CPUUsage{
-				TotalUsage: stats.CPU.UsageUsec * 1000,
-				// PercpuUsage is not supported
-				UsageInKernelmode: stats.CPU.SystemUsec * 1000,
-				UsageInUsermode:   stats.CPU.UserUsec * 1000,
-			},
-			ThrottlingData: types.ThrottlingData{
-				Periods:          stats.CPU.NrPeriods,
-				ThrottledPeriods: stats.CPU.NrThrottled,
-				ThrottledTime:    stats.CPU.ThrottledUsec * 1000,
-			},
-		}
-	}
-
-	if stats.Memory != nil {
-		s.MemoryStats = types.MemoryStats{
-			// Stats is not compatible with v1
-			Stats: map[string]uint64{
-				"anon":                   stats.Memory.Anon,
-				"file":                   stats.Memory.File,
-				"kernel_stack":           stats.Memory.KernelStack,
-				"slab":                   stats.Memory.Slab,
-				"sock":                   stats.Memory.Sock,
-				"shmem":                  stats.Memory.Shmem,
-				"file_mapped":            stats.Memory.FileMapped,
-				"file_dirty":             stats.Memory.FileDirty,
-				"file_writeback":         stats.Memory.FileWriteback,
-				"anon_thp":               stats.Memory.AnonThp,
-				"inactive_anon":          stats.Memory.InactiveAnon,
-				"active_anon":            stats.Memory.ActiveAnon,
-				"inactive_file":          stats.Memory.InactiveFile,
-				"active_file":            stats.Memory.ActiveFile,
-				"unevictable":            stats.Memory.Unevictable,
-				"slab_reclaimable":       stats.Memory.SlabReclaimable,
-				"slab_unreclaimable":     stats.Memory.SlabUnreclaimable,
-				"pgfault":                stats.Memory.Pgfault,
-				"pgmajfault":             stats.Memory.Pgmajfault,
-				"workingset_refault":     stats.Memory.WorkingsetRefault,
-				"workingset_activate":    stats.Memory.WorkingsetActivate,
-				"workingset_nodereclaim": stats.Memory.WorkingsetNodereclaim,
-				"pgrefill":               stats.Memory.Pgrefill,
-				"pgscan":                 stats.Memory.Pgscan,
-				"pgsteal":                stats.Memory.Pgsteal,
-				"pgactivate":             stats.Memory.Pgactivate,
-				"pgdeactivate":           stats.Memory.Pgdeactivate,
-				"pglazyfree":             stats.Memory.Pglazyfree,
-				"pglazyfreed":            stats.Memory.Pglazyfreed,
-				"thp_fault_alloc":        stats.Memory.ThpFaultAlloc,
-				"thp_collapse_alloc":     stats.Memory.ThpCollapseAlloc,
-			},
-			Usage: stats.Memory.Usage,
-			// MaxUsage is not supported
-			Limit: stats.Memory.UsageLimit,
-		}
-		// if the container does not set memory limit, use the machineMemory
-		if s.MemoryStats.Limit > daemon.machineMemory && daemon.machineMemory > 0 {
-			s.MemoryStats.Limit = daemon.machineMemory
-		}
-		if stats.MemoryEvents != nil {
-			// Failcnt is set to the "oom" field of the "memory.events" file.
-			// See https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
-			s.MemoryStats.Failcnt = stats.MemoryEvents.Oom
-		}
-	}
-
-	if stats.Pids != nil {
-		s.PidsStats = types.PidsStats{
-			Current: stats.Pids.Current,
-			Limit:   stats.Pids.Limit,
-		}
-	}
-
-	return s, nil
+	return daemon.Unmount(container)
 }
 
 // setDefaultIsolation determines the default isolation mode for the
 // daemon to run in. This is only applicable on Windows
-func (daemon *Daemon) setDefaultIsolation() error {
-	return nil
-}
-
-// setupDaemonProcess sets various settings for the daemon's process
-func setupDaemonProcess(config *config.Config) error {
-	// setup the daemons oom_score_adj
-	if err := setupOOMScoreAdj(config.OOMScoreAdjust); err != nil {
-		return err
-	}
-	if err := setMayDetachMounts(); err != nil {
-		logrus.WithError(err).Warn("Could not set may_detach_mounts kernel parameter")
-	}
+func (daemon *Daemon) setDefaultIsolation(*config.Config) error {
 	return nil
 }
 
@@ -1685,67 +1427,43 @@ func setMayDetachMounts() error {
 		// unprivileged container. Ignore the error, but log
 		// it if we appear not to be in that situation.
 		if !userns.RunningInUserNS() {
-			logrus.Debugf("Permission denied writing %q to /proc/sys/fs/may_detach_mounts", "1")
+			log.G(context.TODO()).Debugf("Permission denied writing %q to /proc/sys/fs/may_detach_mounts", "1")
 		}
 		return nil
 	}
 	return err
 }
 
-func setupOOMScoreAdj(score int) error {
-	if score == 0 {
-		return nil
-	}
-	f, err := os.OpenFile("/proc/self/oom_score_adj", os.O_WRONLY, 0)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	stringScore := strconv.Itoa(score)
-	_, err = f.WriteString(stringScore)
-	if os.IsPermission(err) {
-		// Setting oom_score_adj does not work in an
-		// unprivileged container. Ignore the error, but log
-		// it if we appear not to be in that situation.
-		if !userns.RunningInUserNS() {
-			logrus.Debugf("Permission denied writing %q to /proc/self/oom_score_adj", stringScore)
-		}
-		return nil
-	}
-
-	return err
-}
-
-func (daemon *Daemon) initCPURtController(mnt, path string) error {
+func (daemon *Daemon) initCPURtController(cfg *config.Config, mnt, path string) error {
 	if path == "/" || path == "." {
 		return nil
 	}
 
 	// Recursively create cgroup to ensure that the system and all parent cgroups have values set
 	// for the period and runtime as this limits what the children can be set to.
-	if err := daemon.initCPURtController(mnt, filepath.Dir(path)); err != nil {
+	if err := daemon.initCPURtController(cfg, mnt, filepath.Dir(path)); err != nil {
 		return err
 	}
 
 	path = filepath.Join(mnt, path)
-	if err := os.MkdirAll(path, 0755); err != nil {
+	if err := os.MkdirAll(path, 0o755); err != nil {
 		return err
 	}
-	if err := maybeCreateCPURealTimeFile(daemon.configStore.CPURealtimePeriod, "cpu.rt_period_us", path); err != nil {
+	if err := maybeCreateCPURealTimeFile(cfg.CPURealtimePeriod, "cpu.rt_period_us", path); err != nil {
 		return err
 	}
-	return maybeCreateCPURealTimeFile(daemon.configStore.CPURealtimeRuntime, "cpu.rt_runtime_us", path)
+	return maybeCreateCPURealTimeFile(cfg.CPURealtimeRuntime, "cpu.rt_runtime_us", path)
 }
 
 func maybeCreateCPURealTimeFile(configValue int64, file string, path string) error {
 	if configValue == 0 {
 		return nil
 	}
-	return os.WriteFile(filepath.Join(path, file), []byte(strconv.FormatInt(configValue, 10)), 0700)
+	return os.WriteFile(filepath.Join(path, file), []byte(strconv.FormatInt(configValue, 10)), 0o700)
 }
 
-func (daemon *Daemon) setupSeccompProfile() error {
-	switch profile := daemon.configStore.SeccompProfile; profile {
+func (daemon *Daemon) setupSeccompProfile(cfg *config.Config) error {
+	switch profile := cfg.SeccompProfile; profile {
 	case "", config.SeccompProfileDefault:
 		daemon.seccompProfilePath = config.SeccompProfileDefault
 	case config.SeccompProfileUnconfined:
@@ -1761,9 +1479,9 @@ func (daemon *Daemon) setupSeccompProfile() error {
 	return nil
 }
 
-func getSysInfo(daemon *Daemon) *sysinfo.SysInfo {
+func getSysInfo(cfg *config.Config) *sysinfo.SysInfo {
 	var siOpts []sysinfo.Opt
-	if daemon.getCgroupDriver() == cgroupSystemdDriver {
+	if cgroupDriver(cfg) == cgroupSystemdDriver {
 		if euid := os.Getenv("ROOTLESSKIT_PARENT_EUID"); euid != "" {
 			siOpts = append(siOpts, sysinfo.WithCgroup2GroupPath("/user.slice/user-"+euid+".slice"))
 		}
@@ -1771,13 +1489,13 @@ func getSysInfo(daemon *Daemon) *sysinfo.SysInfo {
 	return sysinfo.New(siOpts...)
 }
 
-func (daemon *Daemon) initLibcontainerd(ctx context.Context) error {
+func (daemon *Daemon) initLibcontainerd(ctx context.Context, cfg *config.Config) error {
 	var err error
 	daemon.containerd, err = remote.NewClient(
 		ctx,
-		daemon.containerdCli,
-		filepath.Join(daemon.configStore.ExecRoot, "containerd"),
-		daemon.configStore.ContainerdNamespace,
+		daemon.containerdClient,
+		filepath.Join(cfg.ExecRoot, "containerd"),
+		cfg.ContainerdNamespace,
 		daemon,
 	)
 	return err

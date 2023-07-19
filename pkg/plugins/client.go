@@ -9,15 +9,21 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/plugins/transport"
 	"github.com/docker/go-connections/sockets"
 	"github.com/docker/go-connections/tlsconfig"
-	"github.com/sirupsen/logrus"
 )
 
 const (
 	defaultTimeOut = 30
+
+	// dummyHost is a hostname used for local communication.
+	//
+	// For local communications (npipe://, unix://), the hostname is not used,
+	// but we need valid and meaningful hostname.
+	dummyHost = "plugin.moby.localhost"
 )
 
 func newTransport(addr string, tlsConfig *tlsconfig.Options) (transport.Transport, error) {
@@ -44,8 +50,12 @@ func newTransport(addr string, tlsConfig *tlsconfig.Options) (transport.Transpor
 		return nil, err
 	}
 	scheme := httpScheme(u)
-
-	return transport.NewHTTPTransport(tr, scheme, socket), nil
+	hostName := u.Host
+	if hostName == "" || u.Scheme == "unix" || u.Scheme == "npipe" {
+		// Override host header for non-tcp connections.
+		hostName = dummyHost
+	}
+	return transport.NewHTTPTransport(tr, scheme, hostName), nil
 }
 
 // NewClient creates a new plugin client (http).
@@ -116,7 +126,7 @@ func (c *Client) CallWithOptions(serviceMethod string, args interface{}, ret int
 	defer body.Close()
 	if ret != nil {
 		if err := json.NewDecoder(body).Decode(&ret); err != nil {
-			logrus.Errorf("%s: error reading plugin resp: %v", serviceMethod, err)
+			log.G(context.TODO()).Errorf("%s: error reading plugin resp: %v", serviceMethod, err)
 			return err
 		}
 	}
@@ -140,7 +150,7 @@ func (c *Client) SendFile(serviceMethod string, data io.Reader, ret interface{})
 	}
 	defer body.Close()
 	if err := json.NewDecoder(body).Decode(&ret); err != nil {
-		logrus.Errorf("%s: error reading plugin resp: %v", serviceMethod, err)
+		log.G(context.TODO()).Errorf("%s: error reading plugin resp: %v", serviceMethod, err)
 		return err
 	}
 	return nil
@@ -180,7 +190,7 @@ func (c *Client) callWithRetry(serviceMethod string, data io.Reader, retry bool,
 				return nil, err
 			}
 			retries++
-			logrus.Warnf("Unable to connect to plugin: %s%s: %v, retrying in %v", req.URL.Host, req.URL.Path, err, timeOff)
+			log.G(context.TODO()).Warnf("Unable to connect to plugin: %s%s: %v, retrying in %v", req.URL.Host, req.URL.Path, err, timeOff)
 			time.Sleep(timeOff)
 			continue
 		}

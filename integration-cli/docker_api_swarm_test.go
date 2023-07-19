@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -22,7 +21,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/integration-cli/checker"
 	"github.com/docker/docker/integration-cli/daemon"
 	testdaemon "github.com/docker/docker/testutil/daemon"
@@ -733,9 +732,7 @@ func checkClusterHealth(c *testing.T, cl []*daemon.Daemon, managerCount, workerC
 	var totalMCount, totalWCount int
 
 	for _, d := range cl {
-		var (
-			info swarm.Info
-		)
+		var info swarm.Info
 
 		// check info in a poll.WaitOn(), because if the cluster doesn't have a leader, `info` will return an error
 		checkInfo := func(c *testing.T) (interface{}, string) {
@@ -1042,5 +1039,5 @@ func (s *DockerSwarmSuite) TestAPINetworkInspectWithScope(c *testing.T) {
 	assert.Check(c, is.Equal(resp.ID, network.ID))
 
 	_, err = apiclient.NetworkInspect(ctx, name, types.NetworkInspectOptions{Scope: "local"})
-	assert.Check(c, client.IsErrNotFound(err))
+	assert.Check(c, is.ErrorType(err, errdefs.IsNotFound))
 }

@@ -1,17 +1,16 @@
 //go:build linux
-// +build linux
 
 package overlay
 
 import (
+	"context"
 	"fmt"
-	"strings"
 	"syscall"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/libnetwork/drivers/overlay/overlayutils"
 	"github.com/docker/docker/libnetwork/netutils"
 	"github.com/docker/docker/libnetwork/ns"
-	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
@@ -48,7 +47,8 @@ func createVethPair() (string, string, error) {
 	// Generate and add the interface pipe host <-> sandbox
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: name1, TxQLen: 0},
-		PeerName:  name2}
+		PeerName:  name2,
+	}
 	if err := nlh.LinkAdd(veth); err != nil {
 		return "", "", fmt.Errorf("error creating veth pair: %v", err)
 	}
@@ -71,34 +71,6 @@ func createVxlan(name string, vni uint32, mtu int) error {
 		return fmt.Errorf("error creating vxlan interface: %v", err)
 	}
 
-	return nil
-}
-
-func deleteInterfaceBySubnet(brPrefix string, s *subnet) error {
-	nlh := ns.NlHandle()
-	links, err := nlh.LinkList()
-	if err != nil {
-		return fmt.Errorf("failed to list interfaces while deleting bridge interface by subnet: %v", err)
-	}
-
-	for _, l := range links {
-		name := l.Attrs().Name
-		if _, ok := l.(*netlink.Bridge); ok && strings.HasPrefix(name, brPrefix) {
-			addrList, err := nlh.AddrList(l, netlink.FAMILY_V4)
-			if err != nil {
-				logrus.Errorf("error getting AddressList for bridge %s", name)
-				continue
-			}
-			for _, addr := range addrList {
-				if netutils.NetworkOverlaps(addr.IPNet, s.subnetIP) {
-					err = nlh.LinkDel(l)
-					if err != nil {
-						logrus.Errorf("error deleting bridge (%s) with subnet %v: %v", name, addr.IPNet, err)
-					}
-				}
-			}
-		}
-	}
 	return nil
 }
 
@@ -131,7 +103,7 @@ func deleteVxlanByVNI(path string, vni uint32) error {
 		defer nlh.Close()
 		err = nlh.SetSocketTimeout(soTimeout)
 		if err != nil {
-			logrus.Warnf("Failed to set the timeout on the netlink handle sockets for vxlan deletion: %v", err)
+			log.G(context.TODO()).Warnf("Failed to set the timeout on the netlink handle sockets for vxlan deletion: %v", err)
 		}
 	}
 

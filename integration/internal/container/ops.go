@@ -8,7 +8,7 @@ import (
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/go-connections/nat"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // WithName sets the name of the container
@@ -91,6 +91,13 @@ func WithVolume(target string) func(*TestContainerConfig) {
 func WithBind(src, target string) func(*TestContainerConfig) {
 	return func(c *TestContainerConfig) {
 		c.HostConfig.Binds = append(c.HostConfig.Binds, src+":"+target)
+	}
+}
+
+// WithBindRaw sets the bind mount of the container
+func WithBindRaw(s string) func(*TestContainerConfig) {
+	return func(c *TestContainerConfig) {
+		c.HostConfig.Binds = append(c.HostConfig.Binds, s)
 	}
 }
 
@@ -204,7 +211,7 @@ func WithExtraHost(extraHost string) func(*TestContainerConfig) {
 }
 
 // WithPlatform specifies the desired platform the image should have.
-func WithPlatform(p *specs.Platform) func(*TestContainerConfig) {
+func WithPlatform(p *ocispec.Platform) func(*TestContainerConfig) {
 	return func(c *TestContainerConfig) {
 		c.Platform = p
 	}
@@ -235,5 +242,16 @@ func WithConsoleSize(width, height uint) func(*TestContainerConfig) {
 func WithRuntime(name string) func(*TestContainerConfig) {
 	return func(c *TestContainerConfig) {
 		c.HostConfig.Runtime = name
+	}
+}
+
+// WithCDIDevices sets the CDI devices to use to start the container
+func WithCDIDevices(cdiDeviceNames ...string) func(*TestContainerConfig) {
+	return func(c *TestContainerConfig) {
+		request := containertypes.DeviceRequest{
+			Driver:    "cdi",
+			DeviceIDs: cdiDeviceNames,
+		}
+		c.HostConfig.DeviceRequests = append(c.HostConfig.DeviceRequests, request)
 	}
 }

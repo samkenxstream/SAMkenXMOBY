@@ -104,7 +104,7 @@ func TestServiceUpdateSecrets(t *testing.T) {
 				Name: secretTarget,
 				UID:  "0",
 				GID:  "0",
-				Mode: 0600,
+				Mode: 0o600,
 			},
 			SecretID:   resp.ID,
 			SecretName: secretName,
@@ -166,7 +166,7 @@ func TestServiceUpdateConfigs(t *testing.T) {
 				Name: configTarget,
 				UID:  "0",
 				GID:  "0",
-				Mode: 0600,
+				Mode: 0o600,
 			},
 			ConfigID:   resp.ID,
 			ConfigName: configName,
@@ -328,10 +328,12 @@ func TestServiceUpdatePidsLimit(t *testing.T) {
 
 func getServiceTaskContainer(ctx context.Context, t *testing.T, cli client.APIClient, serviceID string) types.ContainerJSON {
 	t.Helper()
-	filter := filters.NewArgs()
-	filter.Add("service", serviceID)
-	filter.Add("desired-state", "running")
-	tasks, err := cli.TaskList(ctx, types.TaskListOptions{Filters: filter})
+	tasks, err := cli.TaskList(ctx, types.TaskListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("service", serviceID),
+			filters.Arg("desired-state", "running"),
+		),
+	})
 	assert.NilError(t, err)
 	assert.Assert(t, len(tasks) > 0)
 

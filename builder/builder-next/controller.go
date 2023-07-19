@@ -16,10 +16,10 @@ import (
 	"github.com/docker/docker/builder/builder-next/adapters/containerimage"
 	"github.com/docker/docker/builder/builder-next/adapters/localinlinecache"
 	"github.com/docker/docker/builder/builder-next/adapters/snapshot"
-	"github.com/docker/docker/builder/builder-next/exporter"
 	"github.com/docker/docker/builder/builder-next/exporter/mobyexporter"
 	"github.com/docker/docker/builder/builder-next/imagerefchecker"
 	mobyworker "github.com/docker/docker/builder/builder-next/worker"
+	wlabel "github.com/docker/docker/builder/builder-next/worker/label"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/graphdriver"
 	units "github.com/docker/go-units"
@@ -96,6 +96,7 @@ func newSnapshotterController(ctx context.Context, rt http.RoundTripper, opt Opt
 
 	wo.GCPolicy = policy
 	wo.RegistryHosts = opt.RegistryHosts
+	wo.Labels = getLabels(opt, wo.Labels)
 
 	exec, err := newExecutor(opt.Root, opt.DefaultCgroupParent, opt.NetworkController, dns, opt.Rootless, opt.IdentityMapping, opt.ApparmorProfile)
 	if err != nil {
@@ -194,7 +195,7 @@ func newGraphDriverController(ctx context.Context, rt http.RoundTripper, opt Opt
 		return nil, err
 	}
 
-	db, err := bolt.Open(filepath.Join(root, "containerdmeta.db"), 0644, nil)
+	db, err := bolt.Open(filepath.Join(root, "containerdmeta.db"), 0o644, nil)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -275,9 +276,9 @@ func newGraphDriverController(ctx context.Context, rt http.RoundTripper, opt Opt
 	}
 
 	exp, err := mobyexporter.New(mobyexporter.Opt{
-		ImageStore:     dist.ImageStore,
-		ReferenceStore: dist.ReferenceStore,
-		Differ:         differ,
+		ImageStore:  dist.ImageStore,
+		Differ:      differ,
+		ImageTagger: opt.ImageTagger,
 	})
 	if err != nil {
 		return nil, err
@@ -303,7 +304,7 @@ func newGraphDriverController(ctx context.Context, rt http.RoundTripper, opt Opt
 		return nil, errors.Errorf("snapshotter doesn't support differ")
 	}
 
-	leases, err := lm.List(ctx, "labels.\"buildkit/lease.temporary\"")
+	leases, err := lm.List(ctx, `labels."buildkit/lease.temporary"`)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +313,7 @@ func newGraphDriverController(ctx context.Context, rt http.RoundTripper, opt Opt
 	}
 
 	wopt := mobyworker.Opt{
-		ID:                exporter.Moby,
+		ID:                opt.EngineID,
 		ContentStore:      store,
 		CacheManager:      cm,
 		GCPolicy:          gcPolicy,
@@ -326,6 +327,7 @@ func newGraphDriverController(ctx context.Context, rt http.RoundTripper, opt Opt
 		Layers:            layers,
 		Platforms:         archutil.SupportedPlatforms(true),
 		LeaseManager:      lm,
+		Labels:            getLabels(opt, nil),
 	}
 
 	wc := &worker.Controller{}
@@ -411,4 +413,12 @@ func getEntitlements(conf config.BuilderConfig) []string {
 		ents = append(ents, string(entitlements.EntitlementSecurityInsecure))
 	}
 	return ents
+}
+
+func getLabels(opt Opt, labels map[string]string) map[string]string {
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[wlabel.HostGatewayIP] = opt.DNSConfig.HostGatewayIP.String()
+	return labels
 }

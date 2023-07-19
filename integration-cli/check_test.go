@@ -18,7 +18,6 @@ import (
 	"github.com/docker/docker/integration-cli/daemon"
 	"github.com/docker/docker/integration-cli/environment"
 	"github.com/docker/docker/internal/test/suite"
-	"github.com/docker/docker/pkg/reexec"
 	testdaemon "github.com/docker/docker/testutil/daemon"
 	ienv "github.com/docker/docker/testutil/environment"
 	"github.com/docker/docker/testutil/fakestorage"
@@ -50,8 +49,6 @@ var (
 func init() {
 	var err error
 
-	reexec.Init() // This is required for external graphdriver tests
-
 	testEnv, err = environment.New()
 	if err != nil {
 		panic(err)
@@ -70,7 +67,21 @@ func TestMain(m *testing.M) {
 	}
 
 	testEnv.Print()
+	printCliVersion()
 	os.Exit(m.Run())
+}
+
+func printCliVersion() {
+	// Print output of "docker version"
+	cli.SetTestEnvironment(testEnv)
+	cmd := cli.Docker(cli.Args("version"))
+	if cmd.Error != nil {
+		fmt.Printf("WARNING: Failed to run 'docker version': %+v\n", cmd.Error)
+		return
+	}
+
+	fmt.Println("INFO: Testing with docker cli version:")
+	fmt.Println(cmd.Stdout())
 }
 
 func ensureTestEnvSetup(t *testing.T) {
@@ -331,8 +342,7 @@ func TestDockerHubPullSuite(t *testing.T) {
 	suite.Run(t, newDockerHubPullSuite())
 }
 
-type DockerSuite struct {
-}
+type DockerSuite struct{}
 
 func (s *DockerSuite) OnTimeout(c *testing.T) {
 	if testEnv.IsRemoteDaemon() {
@@ -587,6 +597,7 @@ func (ps *DockerPluginSuite) registryHost() string {
 func (ps *DockerPluginSuite) getPluginRepo() string {
 	return path.Join(ps.registryHost(), "plugin", "basic")
 }
+
 func (ps *DockerPluginSuite) getPluginRepoWithTag() string {
 	return ps.getPluginRepo() + ":" + "latest"
 }

@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 
 	"github.com/containerd/cgroups/v3"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/homedir"
 	"github.com/docker/docker/pkg/rootless"
@@ -37,6 +37,7 @@ type BridgeConfig struct {
 	commonBridgeConfig
 
 	// Fields below here are platform specific.
+	MTU                         int    `json:"mtu,omitempty"`
 	DefaultIP                   net.IP `json:"ip,omitempty"`
 	IP                          string `json:"bip,omitempty"`
 	DefaultGatewayIPv4          net.IP `json:"default-gateway,omitempty"`
@@ -60,44 +61,25 @@ type Config struct {
 	CommonConfig
 
 	// Fields below here are platform specific.
-	Runtimes             map[string]types.Runtime `json:"runtimes,omitempty"`
-	DefaultInitBinary    string                   `json:"default-init,omitempty"`
-	CgroupParent         string                   `json:"cgroup-parent,omitempty"`
-	EnableSelinuxSupport bool                     `json:"selinux-enabled,omitempty"`
-	RemappedRoot         string                   `json:"userns-remap,omitempty"`
-	Ulimits              map[string]*units.Ulimit `json:"default-ulimits,omitempty"`
-	CPURealtimePeriod    int64                    `json:"cpu-rt-period,omitempty"`
-	CPURealtimeRuntime   int64                    `json:"cpu-rt-runtime,omitempty"`
-	OOMScoreAdjust       int                      `json:"oom-score-adjust,omitempty"`
-	Init                 bool                     `json:"init,omitempty"`
-	InitPath             string                   `json:"init-path,omitempty"`
-	SeccompProfile       string                   `json:"seccomp-profile,omitempty"`
-	ShmSize              opts.MemBytes            `json:"default-shm-size,omitempty"`
-	NoNewPrivileges      bool                     `json:"no-new-privileges,omitempty"`
-	IpcMode              string                   `json:"default-ipc-mode,omitempty"`
-	CgroupNamespaceMode  string                   `json:"default-cgroupns-mode,omitempty"`
+	Runtimes             map[string]system.Runtime `json:"runtimes,omitempty"`
+	DefaultInitBinary    string                    `json:"default-init,omitempty"`
+	CgroupParent         string                    `json:"cgroup-parent,omitempty"`
+	EnableSelinuxSupport bool                      `json:"selinux-enabled,omitempty"`
+	RemappedRoot         string                    `json:"userns-remap,omitempty"`
+	Ulimits              map[string]*units.Ulimit  `json:"default-ulimits,omitempty"`
+	CPURealtimePeriod    int64                     `json:"cpu-rt-period,omitempty"`
+	CPURealtimeRuntime   int64                     `json:"cpu-rt-runtime,omitempty"`
+	OOMScoreAdjust       int                       `json:"oom-score-adjust,omitempty"` // Deprecated: configure the daemon's oom-score-adjust using a process manager instead.
+	Init                 bool                      `json:"init,omitempty"`
+	InitPath             string                    `json:"init-path,omitempty"`
+	SeccompProfile       string                    `json:"seccomp-profile,omitempty"`
+	ShmSize              opts.MemBytes             `json:"default-shm-size,omitempty"`
+	NoNewPrivileges      bool                      `json:"no-new-privileges,omitempty"`
+	IpcMode              string                    `json:"default-ipc-mode,omitempty"`
+	CgroupNamespaceMode  string                    `json:"default-cgroupns-mode,omitempty"`
 	// ResolvConf is the path to the configuration of the host resolver
 	ResolvConf string `json:"resolv-conf,omitempty"`
 	Rootless   bool   `json:"rootless,omitempty"`
-}
-
-// GetRuntime returns the runtime path and arguments for a given
-// runtime name
-func (conf *Config) GetRuntime(name string) *types.Runtime {
-	conf.Lock()
-	defer conf.Unlock()
-	if rt, ok := conf.Runtimes[name]; ok {
-		return &rt
-	}
-	return nil
-}
-
-// GetAllRuntimes returns a copy of the runtimes map
-func (conf *Config) GetAllRuntimes() map[string]types.Runtime {
-	conf.Lock()
-	rts := conf.Runtimes
-	conf.Unlock()
-	return rts
 }
 
 // GetExecRoot returns the user configured Exec-root
@@ -107,8 +89,6 @@ func (conf *Config) GetExecRoot() string {
 
 // GetInitPath returns the configured docker-init path
 func (conf *Config) GetInitPath() string {
-	conf.Lock()
-	defer conf.Unlock()
 	if conf.InitPath != "" {
 		return conf.InitPath
 	}
@@ -184,6 +164,9 @@ func verifyDefaultCgroupNsMode(mode string) error {
 
 // ValidatePlatformConfig checks if any platform-specific configuration settings are invalid.
 func (conf *Config) ValidatePlatformConfig() error {
+	if conf.OOMScoreAdjust != 0 {
+		return errors.New(`DEPRECATED: The "oom-score-adjust" config parameter and the dockerd "--oom-score-adjust" options have been removed.`)
+	}
 	if err := verifyDefaultIpcMode(conf.IpcMode); err != nil {
 		return err
 	}
@@ -201,7 +184,7 @@ func setPlatformDefaults(cfg *Config) error {
 	cfg.ShmSize = opts.MemBytes(DefaultShmSize)
 	cfg.SeccompProfile = SeccompProfileDefault
 	cfg.IpcMode = string(DefaultIpcMode)
-	cfg.Runtimes = make(map[string]types.Runtime)
+	cfg.Runtimes = make(map[string]system.Runtime)
 
 	if cgroups.Mode() != cgroups.Unified {
 		cfg.CgroupNamespaceMode = string(DefaultCgroupV1NamespaceMode)

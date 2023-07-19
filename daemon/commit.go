@@ -92,6 +92,9 @@ func merge(userConf, imageConf *containertypes.Config) error {
 			if userConf.Healthcheck.StartPeriod == 0 {
 				userConf.Healthcheck.StartPeriod = imageConf.Healthcheck.StartPeriod
 			}
+			if userConf.Healthcheck.StartInterval == 0 {
+				userConf.Healthcheck.StartInterval = imageConf.Healthcheck.StartInterval
+			}
 			if userConf.Healthcheck.Retries == 0 {
 				userConf.Healthcheck.Retries = imageConf.Healthcheck.Retries
 			}
@@ -132,13 +135,11 @@ func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string,
 	}
 
 	if container.IsDead() {
-		err := fmt.Errorf("You cannot commit container %s which is Dead", container.ID)
-		return "", errdefs.Conflict(err)
+		return "", errdefs.Conflict(fmt.Errorf("You cannot commit container %s which is Dead", container.ID))
 	}
 
 	if container.IsRemovalInProgress() {
-		err := fmt.Errorf("You cannot commit container %s which is being removed", container.ID)
-		return "", errdefs.Conflict(err)
+		return "", errdefs.Conflict(fmt.Errorf("You cannot commit container %s which is being removed", container.ID))
 	}
 
 	if c.Pause && !container.IsPaused() {

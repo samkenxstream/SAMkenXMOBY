@@ -12,6 +12,7 @@ import (
 	"github.com/containerd/containerd/content"
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types/container"
@@ -40,7 +41,7 @@ func (i *ImageService) ImportImage(ctx context.Context, ref reference.Named, pla
 	if ref != nil {
 		refString = ref.String()
 	}
-	logger := logrus.WithField("ref", refString)
+	logger := log.G(ctx).WithField("ref", refString)
 
 	ctx, release, err := i.client.WithLease(ctx)
 	if err != nil {
@@ -86,11 +87,10 @@ func (i *ImageService) ImportImage(ctx context.Context, ref reference.Named, pla
 	ociCfg := containerConfigToOciImageConfig(imageConfig)
 	createdAt := time.Now()
 	config := ocispec.Image{
-		Architecture: platform.Architecture,
-		OS:           platform.OS,
-		Created:      &createdAt,
-		Author:       "",
-		Config:       ociCfg,
+		Platform: *platform,
+		Created:  &createdAt,
+		Author:   "",
+		Config:   ociCfg,
 		RootFS: ocispec.RootFS{
 			Type:    "layers",
 			DiffIDs: []digest.Digest{uncompressedDigest},
@@ -383,17 +383,21 @@ func storeJson(ctx context.Context, cs content.Ingester, mt string, obj interfac
 
 func containerConfigToOciImageConfig(cfg *container.Config) ocispec.ImageConfig {
 	ociCfg := ocispec.ImageConfig{
-		User:       cfg.User,
-		Env:        cfg.Env,
-		Entrypoint: cfg.Entrypoint,
-		Cmd:        cfg.Cmd,
-		Volumes:    cfg.Volumes,
-		WorkingDir: cfg.WorkingDir,
-		Labels:     cfg.Labels,
-		StopSignal: cfg.StopSignal,
+		User:        cfg.User,
+		Env:         cfg.Env,
+		Entrypoint:  cfg.Entrypoint,
+		Cmd:         cfg.Cmd,
+		Volumes:     cfg.Volumes,
+		WorkingDir:  cfg.WorkingDir,
+		Labels:      cfg.Labels,
+		StopSignal:  cfg.StopSignal,
+		ArgsEscaped: cfg.ArgsEscaped,
 	}
-	for k, v := range cfg.ExposedPorts {
-		ociCfg.ExposedPorts[string(k)] = v
+	if len(cfg.ExposedPorts) > 0 {
+		ociCfg.ExposedPorts = map[string]struct{}{}
+		for k, v := range cfg.ExposedPorts {
+			ociCfg.ExposedPorts[string(k)] = v
+		}
 	}
 
 	return ociCfg

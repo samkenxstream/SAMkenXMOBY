@@ -25,24 +25,11 @@ func TestImagesPruneError(t *testing.T) {
 	}
 
 	_, err := client.ImagesPrune(context.Background(), filters.NewArgs())
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	assert.Check(t, is.ErrorType(err, errdefs.IsSystem))
 }
 
 func TestImagesPrune(t *testing.T) {
-	expectedURL := "/v1.25/images/prune"
-
-	danglingFilters := filters.NewArgs()
-	danglingFilters.Add("dangling", "true")
-
-	noDanglingFilters := filters.NewArgs()
-	noDanglingFilters.Add("dangling", "false")
-
-	labelFilters := filters.NewArgs()
-	labelFilters.Add("dangling", "true")
-	labelFilters.Add("label", "label1=foo")
-	labelFilters.Add("label", "label2!=bar")
+	const expectedURL = "/v1.25/images/prune"
 
 	listCases := []struct {
 		filters             filters.Args
@@ -57,7 +44,7 @@ func TestImagesPrune(t *testing.T) {
 			},
 		},
 		{
-			filters: danglingFilters,
+			filters: filters.NewArgs(filters.Arg("dangling", "true")),
 			expectedQueryParams: map[string]string{
 				"until":   "",
 				"filter":  "",
@@ -65,7 +52,7 @@ func TestImagesPrune(t *testing.T) {
 			},
 		},
 		{
-			filters: noDanglingFilters,
+			filters: filters.NewArgs(filters.Arg("dangling", "false")),
 			expectedQueryParams: map[string]string{
 				"until":   "",
 				"filter":  "",
@@ -73,7 +60,11 @@ func TestImagesPrune(t *testing.T) {
 			},
 		},
 		{
-			filters: labelFilters,
+			filters: filters.NewArgs(
+				filters.Arg("dangling", "true"),
+				filters.Arg("label", "label1=foo"),
+				filters.Arg("label", "label2!=bar"),
+			),
 			expectedQueryParams: map[string]string{
 				"until":   "",
 				"filter":  "",

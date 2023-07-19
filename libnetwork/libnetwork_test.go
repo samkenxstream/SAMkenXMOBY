@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package libnetwork_test
 
@@ -10,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/docker/docker/libnetwork"
@@ -23,19 +21,9 @@ import (
 	"github.com/docker/docker/libnetwork/testutils"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/docker/docker/pkg/plugins"
-	"github.com/docker/docker/pkg/reexec"
-	"github.com/sirupsen/logrus"
 )
 
 func TestMain(m *testing.M) {
-	if runtime.GOOS == "windows" {
-		logrus.Info("Test suite does not currently support windows")
-		os.Exit(0)
-	}
-	if reexec.Init() {
-		return
-	}
-
 	// Cleanup local datastore file
 	_ = os.Remove(datastore.DefaultScope("").Client.Address)
 
@@ -44,15 +32,13 @@ func TestMain(m *testing.M) {
 
 func newController(t *testing.T) *libnetwork.Controller {
 	t.Helper()
-	genericOption := map[string]interface{}{
-		netlabel.GenericData: options.Generic{
-			"EnableIPForwarding": true,
-		},
-	}
-
 	c, err := libnetwork.New(
 		libnetwork.OptionBoltdbWithRandomDBFile(t),
-		config.OptionDriverConfig(bridgeNetType, genericOption),
+		config.OptionDriverConfig(bridgeNetType, map[string]interface{}{
+			netlabel.GenericData: options.Generic{
+				"EnableIPForwarding": true,
+			},
+		}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -68,9 +54,7 @@ func createTestNetwork(c *libnetwork.Controller, networkType, networkName string
 }
 
 func getEmptyGenericOption() map[string]interface{} {
-	genericOption := make(map[string]interface{})
-	genericOption[netlabel.GenericData] = map[string]string{}
-	return genericOption
+	return map[string]interface{}{netlabel.GenericData: map[string]string{}}
 }
 
 func getPortMapping() []types.PortBinding {
@@ -1184,7 +1168,7 @@ func TestInvalidRemoteDriver(t *testing.T) {
 		fmt.Fprintln(w, `{"Implements": ["InvalidDriver"]}`)
 	})
 
-	if err := os.MkdirAll(specPath, 0755); err != nil {
+	if err := os.MkdirAll(specPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -1193,7 +1177,7 @@ func TestInvalidRemoteDriver(t *testing.T) {
 		}
 	}()
 
-	if err := os.WriteFile(filepath.Join(specPath, "invalid-network-driver.spec"), []byte(server.URL), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(specPath, "invalid-network-driver.spec"), []byte(server.URL), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1239,7 +1223,7 @@ func TestValidRemoteDriver(t *testing.T) {
 		fmt.Fprintf(w, "null")
 	})
 
-	if err := os.MkdirAll(specPath, 0755); err != nil {
+	if err := os.MkdirAll(specPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -1248,7 +1232,7 @@ func TestValidRemoteDriver(t *testing.T) {
 		}
 	}()
 
-	if err := os.WriteFile(filepath.Join(specPath, "valid-network-driver.spec"), []byte(server.URL), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(specPath, "valid-network-driver.spec"), []byte(server.URL), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

@@ -1,10 +1,11 @@
 package config // import "github.com/docker/docker/daemon/config"
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 
-	"github.com/docker/docker/api/types"
+	"github.com/containerd/containerd/log"
 )
 
 const (
@@ -18,6 +19,10 @@ const (
 // configuration.
 type BridgeConfig struct {
 	commonBridgeConfig
+
+	// MTU is not actually used on Windows, but the --mtu option has always
+	// been there on Windows (but ignored).
+	MTU int `json:"mtu,omitempty"`
 }
 
 // Config defines the configuration of a docker daemon.
@@ -28,17 +33,6 @@ type Config struct {
 
 	// Fields below here are platform specific. (There are none presently
 	// for the Windows daemon.)
-}
-
-// GetRuntime returns the runtime path and arguments for a given
-// runtime name
-func (conf *Config) GetRuntime(name string) *types.Runtime {
-	return nil
-}
-
-// GetAllRuntimes returns a copy of the runtimes map
-func (conf *Config) GetAllRuntimes() map[string]types.Runtime {
-	return map[string]types.Runtime{}
 }
 
 // GetExecRoot returns the user configured Exec-root
@@ -58,6 +52,9 @@ func (conf *Config) IsSwarmCompatible() error {
 
 // ValidatePlatformConfig checks if any platform-specific configuration settings are invalid.
 func (conf *Config) ValidatePlatformConfig() error {
+	if conf.MTU != 0 && conf.MTU != DefaultNetworkMtu {
+		log.G(context.TODO()).Warn(`WARNING: MTU for the default network is not configurable on Windows, and this option will be ignored.`)
+	}
 	return nil
 }
 

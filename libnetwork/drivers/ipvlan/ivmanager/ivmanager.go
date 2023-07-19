@@ -11,20 +11,12 @@ const networkType = "ipvlan"
 
 type driver struct{}
 
-// Init registers a new instance of the ipvlan manager driver.
-//
-// Deprecated: use [Register].
-func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
-	return Register(dc, config)
-}
-
 // Register registers a new instance of the ipvlan manager driver.
-func Register(r driverapi.Registerer, config map[string]interface{}) error {
-	c := driverapi.Capability{
+func Register(r driverapi.Registerer) error {
+	return r.RegisterDriver(networkType, &driver{}, driverapi.Capability{
 		DataScope:         datastore.LocalScope,
 		ConnectivityScope: datastore.GlobalScope,
-	}
-	return r.RegisterDriver(networkType, &driver{}, c)
+	})
 }
 
 func (d *driver) NetworkAllocate(id string, option map[string]string, ipV4Data, ipV6Data []driverapi.IPAMData) (map[string]string, error) {

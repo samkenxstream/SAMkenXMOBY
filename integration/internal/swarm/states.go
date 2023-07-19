@@ -88,8 +88,7 @@ func RunningTasksCount(client client.ServiceAPIClient, serviceID string, instanc
 // completed additionally, while polling, it verifies that the job never
 // exceeds MaxConcurrent running tasks
 func JobComplete(client client.CommonAPIClient, service swarmtypes.Service) func(log poll.LogT) poll.Result {
-	filter := filters.NewArgs()
-	filter.Add("service", service.ID)
+	filter := filters.NewArgs(filters.Arg("service", service.ID))
 
 	var jobIteration swarmtypes.Version
 	if service.JobStatus != nil {
@@ -108,7 +107,6 @@ func JobComplete(client client.CommonAPIClient, service swarmtypes.Service) func
 		tasks, err := client.TaskList(context.Background(), types.TaskListOptions{
 			Filters: filter,
 		})
-
 		if err != nil {
 			poll.Error(err)
 		}

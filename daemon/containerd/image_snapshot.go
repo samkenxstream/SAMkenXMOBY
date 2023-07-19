@@ -3,16 +3,17 @@ package containerd
 import (
 	"context"
 
+	"github.com/containerd/containerd"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/platforms"
 	"github.com/opencontainers/image-spec/identity"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // PrepareSnapshot prepares a snapshot from a parent image for a container
-func (i *ImageService) PrepareSnapshot(ctx context.Context, id string, parentImage string, platform *v1.Platform) error {
-	desc, err := i.resolveDescriptor(ctx, parentImage)
+func (i *ImageService) PrepareSnapshot(ctx context.Context, id string, parentImage string, platform *ocispec.Platform) error {
+	img, err := i.resolveImage(ctx, parentImage)
 	if err != nil {
 		return err
 	}
@@ -24,7 +25,19 @@ func (i *ImageService) PrepareSnapshot(ctx context.Context, id string, parentIma
 		matcher = platforms.Only(*platform)
 	}
 
-	desc, err = containerdimages.Config(ctx, cs, desc, matcher)
+	platformImg := containerd.NewImageWithPlatform(i.client, img, matcher)
+	unpacked, err := platformImg.IsUnpacked(ctx, i.snapshotter)
+	if err != nil {
+		return err
+	}
+
+	if !unpacked {
+		if err := platformImg.Unpack(ctx, i.snapshotter); err != nil {
+			return err
+		}
+	}
+
+	desc, err := containerdimages.Config(ctx, cs, img.Target, matcher)
 	if err != nil {
 		return err
 	}
@@ -51,9 +64,6 @@ func (i *ImageService) PrepareSnapshot(ctx context.Context, id string, parentIma
 	}
 
 	s := i.client.SnapshotService(i.StorageDriver())
-	if _, err := s.Prepare(ctx, id, parent); err == nil {
-		return err
-	}
-
-	return nil
+	_, err = s.Prepare(ctx, id, parent)
+	return err
 }

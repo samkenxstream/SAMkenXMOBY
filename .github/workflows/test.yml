@@ -15,7 +15,7 @@ on:
   pull_request:
 
 env:
-  GO_VERSION: "1.20.3"
+  GO_VERSION: "1.20.6"
   GOTESTLIST_VERSION: v0.3.1
   TESTSTAT_VERSION: v0.1.3
   ITG_CLI_MATRIX_SIZE: 6
@@ -73,7 +73,7 @@ jobs:
         name: Create matrix
         id: scripts
         run: |
-          scripts=$(jq -ncR '[inputs]' <<< "$(ls -I .validate -I all -I default -I dco -I golangci-lint.yml -I yamllint.yaml -A ./hack/validate/)")
+          scripts=$(cd ./hack/validate && jq -nc '$ARGS.positional - ["all", "default", "dco"] | map(select(test("[.]")|not)) + ["generate-files"]' --args *)
           echo "matrix=$scripts" >> $GITHUB_OUTPUT
       -
         name: Show matrix
@@ -82,6 +82,7 @@ jobs:
 
   validate:
     runs-on: ubuntu-20.04
+    timeout-minutes: 120
     needs:
       - validate-prepare
       - build-dev

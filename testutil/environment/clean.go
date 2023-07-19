@@ -19,18 +19,18 @@ import (
 // depend on each others.
 func (e *Execution) Clean(t testing.TB) {
 	t.Helper()
-	client := e.APIClient()
+	apiClient := e.APIClient()
 
-	platform := e.OSType
+	platform := e.DaemonInfo.OSType
 	if (platform != "windows") || (platform == "windows" && e.DaemonInfo.Isolation == "hyperv") {
-		unpauseAllContainers(t, client)
+		unpauseAllContainers(t, apiClient)
 	}
-	deleteAllContainers(t, client, e.protectedElements.containers)
-	deleteAllImages(t, client, e.protectedElements.images)
-	deleteAllVolumes(t, client, e.protectedElements.volumes)
-	deleteAllNetworks(t, client, platform, e.protectedElements.networks)
+	deleteAllContainers(t, apiClient, e.protectedElements.containers)
+	deleteAllImages(t, apiClient, e.protectedElements.images)
+	deleteAllVolumes(t, apiClient, e.protectedElements.volumes)
+	deleteAllNetworks(t, apiClient, platform, e.protectedElements.networks)
 	if platform == "linux" {
-		deleteAllPlugins(t, client, e.protectedElements.plugins)
+		deleteAllPlugins(t, apiClient, e.protectedElements.plugins)
 	}
 }
 
@@ -48,10 +48,8 @@ func unpauseAllContainers(t testing.TB, client client.ContainerAPIClient) {
 
 func getPausedContainers(ctx context.Context, t testing.TB, client client.ContainerAPIClient) []types.Container {
 	t.Helper()
-	filter := filters.NewArgs()
-	filter.Add("status", "paused")
 	containers, err := client.ContainerList(ctx, types.ContainerListOptions{
-		Filters: filter,
+		Filters: filters.NewArgs(filters.Arg("status", "paused")),
 		All:     true,
 	})
 	assert.Check(t, err, "failed to list containers")
@@ -76,7 +74,7 @@ func deleteAllContainers(t testing.TB, apiclient client.ContainerAPIClient, prot
 			Force:         true,
 			RemoveVolumes: true,
 		})
-		if err == nil || client.IsErrNotFound(err) || alreadyExists.MatchString(err.Error()) || isErrNotFoundSwarmClassic(err) {
+		if err == nil || errdefs.IsNotFound(err) || alreadyExists.MatchString(err.Error()) || isErrNotFoundSwarmClassic(err) {
 			continue
 		}
 		assert.Check(t, err, "failed to remove %s", container.ID)
@@ -100,6 +98,9 @@ func deleteAllImages(t testing.TB, apiclient client.ImageAPIClient, protectedIma
 	ctx := context.Background()
 	for _, image := range images {
 		tags := tagsFromImageSummary(image)
+		if _, ok := protectedImages[image.ID]; ok {
+			continue
+		}
 		if len(tags) == 0 {
 			removeImage(ctx, t, apiclient, image.ID)
 			continue
@@ -117,7 +118,7 @@ func removeImage(ctx context.Context, t testing.TB, apiclient client.ImageAPICli
 	_, err := apiclient.ImageRemove(ctx, ref, types.ImageRemoveOptions{
 		Force: true,
 	})
-	if client.IsErrNotFound(err) {
+	if errdefs.IsNotFound(err) {
 		return
 	}
 	assert.Check(t, err, "failed to remove image %s", ref)

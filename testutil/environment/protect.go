@@ -40,7 +40,7 @@ func ProtectAll(t testing.TB, testEnv *Execution) {
 	ProtectImages(t, testEnv)
 	ProtectNetworks(t, testEnv)
 	ProtectVolumes(t, testEnv)
-	if testEnv.OSType == "linux" {
+	if testEnv.DaemonInfo.OSType == "linux" {
 		ProtectPlugins(t, testEnv)
 	}
 }
@@ -91,20 +91,19 @@ func ProtectImages(t testing.TB, testEnv *Execution) {
 	t.Helper()
 	images := getExistingImages(t, testEnv)
 
-	if testEnv.OSType == "linux" {
+	if testEnv.DaemonInfo.OSType == "linux" {
 		images = append(images, frozenImages...)
 	}
 	testEnv.ProtectImage(t, images...)
+	testEnv.ProtectImage(t, DanglingImageIdGraphDriver, DanglingImageIdSnapshotter)
 }
 
 func getExistingImages(t testing.TB, testEnv *Execution) []string {
 	t.Helper()
 	client := testEnv.APIClient()
-	filter := filters.NewArgs()
-	filter.Add("dangling", "false")
 	imageList, err := client.ImageList(context.Background(), types.ImageListOptions{
 		All:     true,
-		Filters: filter,
+		Filters: filters.NewArgs(filters.Arg("dangling", "false")),
 	})
 	assert.NilError(t, err, "failed to list images")
 

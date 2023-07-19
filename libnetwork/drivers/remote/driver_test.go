@@ -46,13 +46,13 @@ func setupPlugin(t *testing.T, name string, mux *http.ServeMux) func() {
 		specPath = filepath.Join(os.Getenv("programdata"), "docker", "plugins")
 	}
 
-	if err := os.MkdirAll(specPath, 0755); err != nil {
+	if err := os.MkdirAll(specPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	defer func() {
 		if t.Failed() {
-			os.RemoveAll(specPath)
+			_ = os.RemoveAll(specPath)
 		}
 	}()
 
@@ -61,7 +61,7 @@ func setupPlugin(t *testing.T, name string, mux *http.ServeMux) func() {
 		t.Fatal("Failed to start an HTTP Server")
 	}
 
-	if err := os.WriteFile(filepath.Join(specPath, name+".spec"), []byte(server.URL), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(specPath, name+".spec"), []byte(server.URL), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -167,11 +167,11 @@ func compareIPs(t *testing.T, kind string, shouldBe string, supplied net.IP) {
 }
 
 func compareIPNets(t *testing.T, kind string, shouldBe string, supplied net.IPNet) {
-	_, net, _ := net.ParseCIDR(shouldBe)
-	if net == nil {
+	_, ipNet, _ := net.ParseCIDR(shouldBe)
+	if ipNet == nil {
 		t.Fatalf(`Invalid IP network to test against: "%s"`, shouldBe)
 	}
-	if !types.CompareIPNet(net, &supplied) {
+	if !types.CompareIPNet(ipNet, &supplied) {
 		t.Fatalf(`%s IP networks are not equal: expected "%s", got %v`, kind, shouldBe, supplied)
 	}
 }
@@ -216,7 +216,7 @@ func (test *testEndpoint) AddTableEntry(tableName string, key string, value []by
 }
 
 func TestGetEmptyCapabilities(t *testing.T) {
-	var plugin = "test-net-driver-empty-cap"
+	plugin := "test-net-driver-empty-cap"
 
 	mux := http.NewServeMux()
 	defer setupPlugin(t, plugin, mux)()
@@ -246,7 +246,7 @@ func TestGetEmptyCapabilities(t *testing.T) {
 }
 
 func TestGetExtraCapabilities(t *testing.T) {
-	var plugin = "test-net-driver-extra-cap"
+	plugin := "test-net-driver-extra-cap"
 
 	mux := http.NewServeMux()
 	defer setupPlugin(t, plugin, mux)()
@@ -284,7 +284,7 @@ func TestGetExtraCapabilities(t *testing.T) {
 }
 
 func TestGetInvalidCapabilities(t *testing.T) {
-	var plugin = "test-net-driver-invalid-cap"
+	plugin := "test-net-driver-invalid-cap"
 
 	mux := http.NewServeMux()
 	defer setupPlugin(t, plugin, mux)()
@@ -316,7 +316,7 @@ func TestGetInvalidCapabilities(t *testing.T) {
 }
 
 func TestRemoteDriver(t *testing.T) {
-	var plugin = "test-net-driver"
+	plugin := "test-net-driver"
 
 	ep := &testEndpoint{
 		t:              t,
@@ -484,7 +484,7 @@ func TestRemoteDriver(t *testing.T) {
 }
 
 func TestDriverError(t *testing.T) {
-	var plugin = "test-net-driver-error"
+	plugin := "test-net-driver-error"
 
 	mux := http.NewServeMux()
 	defer setupPlugin(t, plugin, mux)()
@@ -504,15 +504,15 @@ func TestDriverError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	driver := newDriver(plugin, client)
 
-	if err := driver.CreateEndpoint("dummy", "dummy", &testEndpoint{t: t}, map[string]interface{}{}); err == nil {
+	d := newDriver(plugin, client)
+	if err := d.CreateEndpoint("dummy", "dummy", &testEndpoint{t: t}, map[string]interface{}{}); err == nil {
 		t.Fatal("Expected error from driver")
 	}
 }
 
 func TestMissingValues(t *testing.T) {
-	var plugin = "test-net-driver-missing"
+	plugin := "test-net-driver-missing"
 
 	mux := http.NewServeMux()
 	defer setupPlugin(t, plugin, mux)()
@@ -541,15 +541,14 @@ func TestMissingValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	driver := newDriver(plugin, client)
 
-	if err := driver.CreateEndpoint("dummy", "dummy", ep, map[string]interface{}{}); err != nil {
+	d := newDriver(plugin, client)
+	if err := d.CreateEndpoint("dummy", "dummy", ep, map[string]interface{}{}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-type rollbackEndpoint struct {
-}
+type rollbackEndpoint struct{}
 
 func (r *rollbackEndpoint) Interface() driverapi.InterfaceInfo {
 	return r
@@ -576,7 +575,7 @@ func (r *rollbackEndpoint) SetIPAddress(ip *net.IPNet) error {
 }
 
 func TestRollback(t *testing.T) {
-	var plugin = "test-net-driver-rollback"
+	plugin := "test-net-driver-rollback"
 
 	mux := http.NewServeMux()
 	defer setupPlugin(t, plugin, mux)()
@@ -607,11 +606,10 @@ func TestRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	driver := newDriver(plugin, client)
 
+	d := newDriver(plugin, client)
 	ep := &rollbackEndpoint{}
-
-	if err := driver.CreateEndpoint("dummy", "dummy", ep.Interface(), map[string]interface{}{}); err == nil {
+	if err := d.CreateEndpoint("dummy", "dummy", ep.Interface(), map[string]interface{}{}); err == nil {
 		t.Fatal("Expected error from driver")
 	}
 	if !rolledback {

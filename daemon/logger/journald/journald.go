@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package journald // import "github.com/docker/docker/daemon/logger/journald"
 
@@ -76,7 +75,7 @@ func init() {
 	}
 }
 
-// sanitizeKeyMode returns the sanitized string so that it could be used in journald.
+// sanitizeKeyMod returns the sanitized string so that it could be used in journald.
 // In journald log, there are special requirements for fields.
 // Fields must be composed of uppercase letters, numbers, and underscores, but must
 // not start with an underscore.

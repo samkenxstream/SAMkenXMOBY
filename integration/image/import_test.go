@@ -22,12 +22,12 @@ import (
 func TestImportExtremelyLargeImageWorks(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, runtime.GOARCH == "arm64", "effective test will be time out")
-	skip.If(t, testEnv.OSType == "windows", "TODO enable on windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "TODO enable on windows")
 	t.Parallel()
 
 	// Spin up a new daemon, so that we can run this test in parallel (it's a slow test)
 	d := daemon.New(t)
-	d.Start(t)
+	d.Start(t, "--iptables=false")
 	defer d.Stop(t)
 
 	client := d.NewClientT(t)
@@ -51,7 +51,7 @@ func TestImportExtremelyLargeImageWorks(t *testing.T) {
 }
 
 func TestImportWithCustomPlatform(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows", "TODO enable on windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "TODO enable on windows")
 
 	defer setupTest(t)()
 	client := testEnv.APIClient()

@@ -9,26 +9,18 @@ import (
 	"github.com/docker/docker/libnetwork/types"
 )
 
-const networkType = "host"
+const NetworkType = "host"
 
 type driver struct {
 	network string
 	sync.Mutex
 }
 
-// Init registers a new instance of host driver.
-//
-// Deprecated: use [Register].
-func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
-	return Register(dc, config)
-}
-
-func Register(r driverapi.Registerer, config map[string]interface{}) error {
-	c := driverapi.Capability{
+func Register(r driverapi.Registerer) error {
+	return r.RegisterDriver(NetworkType, &driver{}, driverapi.Capability{
 		DataScope:         datastore.LocalScope,
 		ConnectivityScope: datastore.LocalScope,
-	}
-	return r.RegisterDriver(networkType, &driver{}, c)
+	})
 }
 
 func (d *driver) NetworkAllocate(id string, option map[string]string, ipV4Data, ipV6Data []driverapi.IPAMData) (map[string]string, error) {
@@ -51,7 +43,7 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 	defer d.Unlock()
 
 	if d.network != "" {
-		return types.ForbiddenErrorf("only one instance of \"%s\" network is allowed", networkType)
+		return types.ForbiddenErrorf("only one instance of %q network is allowed", NetworkType)
 	}
 
 	d.network = id
@@ -60,7 +52,7 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, nInfo d
 }
 
 func (d *driver) DeleteNetwork(nid string) error {
-	return types.ForbiddenErrorf("network of type \"%s\" cannot be deleted", networkType)
+	return types.ForbiddenErrorf("network of type %q cannot be deleted", NetworkType)
 }
 
 func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo, epOptions map[string]interface{}) error {
@@ -94,7 +86,7 @@ func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
 }
 
 func (d *driver) Type() string {
-	return networkType
+	return NetworkType
 }
 
 func (d *driver) IsBuiltIn() bool {

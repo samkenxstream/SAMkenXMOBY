@@ -1,12 +1,19 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.20.3
+ARG GO_VERSION=1.20.6
 ARG BASE_DEBIAN_DISTRO="bullseye"
 ARG GOLANG_IMAGE="golang:${GO_VERSION}-${BASE_DEBIAN_DISTRO}"
-ARG XX_VERSION=1.1.2
+ARG XX_VERSION=1.2.1
 
 ARG VPNKIT_VERSION=0.5.0
-ARG DOCKERCLI_VERSION=v17.06.2-ce
+
+ARG DOCKERCLI_REPOSITORY="https://github.com/docker/cli.git"
+ARG DOCKERCLI_VERSION=v24.0.2
+# cli version used for integration-cli tests
+ARG DOCKERCLI_INTEGRATION_REPOSITORY="https://github.com/docker/cli.git"
+ARG DOCKERCLI_INTEGRATION_VERSION=v17.06.2-ce
+ARG BUILDX_VERSION=0.11.0
+ARG COMPOSE_VERSION=v2.20.0
 
 ARG SYSTEMD="false"
 ARG DEBIAN_FRONTEND=noninteractive
@@ -27,8 +34,7 @@ FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE} AS base
 COPY --from=xx / /
 RUN echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 ARG APT_MIRROR
-RUN sed -ri "s/(httpredir|deb).debian.org/${APT_MIRROR:-deb.debian.org}/g" /etc/apt/sources.list \
- && sed -ri "s/(security).debian.org/${APT_MIRROR:-security.debian.org}/g" /etc/apt/sources.list
+RUN test -n "$APT_MIRROR" && sed -ri "s#(httpredir|deb|security).debian.org#${APT_MIRROR}#g" /etc/apt/sources.list || true
 ARG DEBIAN_FRONTEND
 RUN apt-get update && apt-get install --no-install-recommends -y file
 ENV GO111MODULE=off
@@ -192,7 +198,7 @@ RUN git init . && git remote add origin "https://github.com/containerd/container
 # When updating the binary version you may also need to update the vendor
 # version to pick up bug fixes or new APIs, however, usually the Go packages
 # are built from a commit from the master branch.
-ARG CONTAINERD_VERSION=v1.7.0
+ARG CONTAINERD_VERSION=v1.7.1
 RUN git fetch -q --depth 1 origin "${CONTAINERD_VERSION}" +refs/tags/*:refs/tags/* && git checkout -q FETCH_HEAD
 
 FROM base AS containerd-build
@@ -243,34 +249,29 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
         GOBIN=/build/ GO111MODULE=on go install "mvdan.cc/sh/v3/cmd/shfmt@${SHFMT_VERSION}" \
      && /build/shfmt --version
 
-# dockercli
-FROM base AS dockercli-src
-WORKDIR /tmp/dockercli
-RUN git init . && git remote add origin "https://github.com/docker/cli.git"
-ARG DOCKERCLI_VERSION
-RUN git fetch -q --depth 1 origin "${DOCKERCLI_VERSION}" +refs/tags/*:refs/tags/* && git checkout -q FETCH_HEAD
-RUN [ -d ./components/cli ] && mv ./components/cli /usr/src/dockercli || mv /tmp/dockercli /usr/src/dockercli
-WORKDIR /usr/src/dockercli
-
 FROM base AS dockercli
 WORKDIR /go/src/github.com/docker/cli
+ARG DOCKERCLI_REPOSITORY
 ARG DOCKERCLI_VERSION
-ARG DOCKERCLI_CHANNEL=stable
 ARG TARGETPLATFORM
-RUN xx-apt-get install -y --no-install-recommends gcc libc6-dev
-RUN --mount=from=dockercli-src,src=/usr/src/dockercli,rw \
-    --mount=type=cache,target=/root/.cache/go-build,id=dockercli-build-$TARGETPLATFORM <<EOT
-  set -e
-  DOWNLOAD_URL="https://download.docker.com/linux/static/${DOCKERCLI_CHANNEL}/$(xx-info march)/docker-${DOCKERCLI_VERSION#v}.tgz"
-  if curl --head --silent --fail "${DOWNLOAD_URL}" 1>/dev/null 2>&1; then
-    mkdir /build
-    curl -Ls "${DOWNLOAD_URL}" | tar -xz docker/docker
-    mv docker/docker /build/docker
-  else
-    CGO_ENABLED=0 xx-go build -o /build/docker ./cmd/docker
-  fi
-  xx-verify /build/docker
-EOT
+RUN --mount=source=hack/dockerfile/cli.sh,target=/download-or-build-cli.sh \
+    --mount=type=cache,id=dockercli-git-$TARGETPLATFORM,sharing=locked,target=./.git \
+    --mount=type=cache,target=/root/.cache/go-build,id=dockercli-build-$TARGETPLATFORM \
+        rm -f ./.git/*.lock \
+     && /download-or-build-cli.sh ${DOCKERCLI_VERSION} ${DOCKERCLI_REPOSITORY} /build \
+     && /build/docker --version
+
+FROM base AS dockercli-integration
+WORKDIR /go/src/github.com/docker/cli
+ARG DOCKERCLI_INTEGRATION_REPOSITORY
+ARG DOCKERCLI_INTEGRATION_VERSION
+ARG TARGETPLATFORM
+RUN --mount=source=hack/dockerfile/cli.sh,target=/download-or-build-cli.sh \
+    --mount=type=cache,id=dockercli-git-$TARGETPLATFORM,sharing=locked,target=./.git \
+    --mount=type=cache,target=/root/.cache/go-build,id=dockercli-build-$TARGETPLATFORM \
+        rm -f ./.git/*.lock \
+     && /download-or-build-cli.sh ${DOCKERCLI_INTEGRATION_VERSION} ${DOCKERCLI_INTEGRATION_REPOSITORY} /build \
+     && /build/docker --version
 
 # runc
 FROM base AS runc-src
@@ -280,7 +281,7 @@ RUN git init . && git remote add origin "https://github.com/opencontainers/runc.
 # that is used. If you need to update runc, open a pull request in the containerd
 # project first, and update both after that is merged. When updating RUNC_VERSION,
 # consider updating runc in vendor.mod accordingly.
-ARG RUNC_VERSION=v1.1.5
+ARG RUNC_VERSION=v1.1.7
 RUN git fetch -q --depth 1 origin "${RUNC_VERSION}" +refs/tags/*:refs/tags/* && git checkout -q FETCH_HEAD
 
 FROM base AS runc-build
@@ -368,8 +369,8 @@ RUN --mount=from=rootlesskit-src,src=/usr/src/rootlesskit,rw \
   xx-go build -o /build/rootlesskit-docker-proxy -ldflags="$([ "$DOCKER_STATIC" != "1" ] && echo "-linkmode=external")" ./cmd/rootlesskit-docker-proxy
   xx-verify $([ "$DOCKER_STATIC" = "1" ] && echo "--static") /build/rootlesskit-docker-proxy
 EOT
-COPY ./contrib/dockerd-rootless.sh /build/
-COPY ./contrib/dockerd-rootless-setuptool.sh /build/
+COPY --link ./contrib/dockerd-rootless.sh /build/
+COPY --link ./contrib/dockerd-rootless-setuptool.sh /build/
 
 FROM rootlesskit-build AS rootlesskit-linux
 FROM binary-dummy AS rootlesskit-windows
@@ -437,28 +438,38 @@ FROM binary-dummy AS containerutil-linux
 FROM containerutil-build AS containerutil-windows-amd64
 FROM containerutil-windows-${TARGETARCH} AS containerutil-windows
 FROM containerutil-${TARGETOS} AS containerutil
+FROM docker/buildx-bin:${BUILDX_VERSION} as buildx
+FROM docker/compose-bin:${COMPOSE_VERSION} as compose
 
 FROM base AS dev-systemd-false
-COPY --from=dockercli     /build/ /usr/local/cli
-COPY --from=frozen-images /build/ /docker-frozen-images
-COPY --from=swagger       /build/ /usr/local/bin/
-COPY --from=delve         /build/ /usr/local/bin/
-COPY --from=tomll         /build/ /usr/local/bin/
-COPY --from=gowinres      /build/ /usr/local/bin/
-COPY --from=tini          /build/ /usr/local/bin/
-COPY --from=registry      /build/ /usr/local/bin/
-COPY --from=criu          /build/ /usr/local/bin/
-COPY --from=gotestsum     /build/ /usr/local/bin/
-COPY --from=golangci_lint /build/ /usr/local/bin/
-COPY --from=shfmt         /build/ /usr/local/bin/
-COPY --from=runc          /build/ /usr/local/bin/
-COPY --from=containerd    /build/ /usr/local/bin/
-COPY --from=rootlesskit   /build/ /usr/local/bin/
-COPY --from=vpnkit        /       /usr/local/bin/
-COPY --from=containerutil /build/ /usr/local/bin/
-COPY --from=crun          /build/ /usr/local/bin/
-COPY hack/dockerfile/etc/docker/  /etc/docker/
+COPY --link --from=frozen-images /build/ /docker-frozen-images
+COPY --link --from=swagger       /build/ /usr/local/bin/
+COPY --link --from=delve         /build/ /usr/local/bin/
+COPY --link --from=tomll         /build/ /usr/local/bin/
+COPY --link --from=gowinres      /build/ /usr/local/bin/
+COPY --link --from=tini          /build/ /usr/local/bin/
+COPY --link --from=registry      /build/ /usr/local/bin/
+
+# Skip the CRIU stage for now, as the opensuse package repository is sometimes
+# unstable, and we're currently not using it in CI.
+#
+# FIXME(thaJeztah): re-enable this stage when https://github.com/moby/moby/issues/38963 is resolved (see https://github.com/moby/moby/pull/38984)
+# COPY --link --from=criu          /build/ /usr/local/bin/
+COPY --link --from=gotestsum     /build/ /usr/local/bin/
+COPY --link --from=golangci_lint /build/ /usr/local/bin/
+COPY --link --from=shfmt         /build/ /usr/local/bin/
+COPY --link --from=runc          /build/ /usr/local/bin/
+COPY --link --from=containerd    /build/ /usr/local/bin/
+COPY --link --from=rootlesskit   /build/ /usr/local/bin/
+COPY --link --from=vpnkit        /       /usr/local/bin/
+COPY --link --from=containerutil /build/ /usr/local/bin/
+COPY --link --from=crun          /build/ /usr/local/bin/
+COPY --link hack/dockerfile/etc/docker/  /etc/docker/
+COPY --link --from=buildx        /buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+COPY --link --from=compose       /docker-compose /usr/libexec/docker/cli-plugins/docker-compose
+
 ENV PATH=/usr/local/cli:$PATH
+ENV TEST_CLIENT_BINARY=/usr/local/cli-integration/docker
 ENV CONTAINERD_ADDRESS=/run/docker/containerd/containerd.sock
 ENV CONTAINERD_NAMESPACE=moby
 WORKDIR /go/src/github.com/docker/docker
@@ -544,6 +555,8 @@ RUN --mount=type=cache,sharing=locked,id=moby-dev-aptlib,target=/var/lib/apt \
             libsecret-1-dev \
             libsystemd-dev \
             libudev-dev
+COPY --link --from=dockercli             /build/ /usr/local/cli
+COPY --link --from=dockercli-integration /build/ /usr/local/cli-integration
 
 FROM base AS build
 COPY --from=gowinres /build/ /usr/local/bin/
@@ -589,7 +602,7 @@ RUN <<EOT
     XX_CC_PREFER_LINKER=ld xx-clang --setup-target-triple
   fi
 EOT
-RUN --mount=type=bind,target=. \
+RUN --mount=type=bind,target=.,rw \
     --mount=type=tmpfs,target=cli/winresources/dockerd \
     --mount=type=tmpfs,target=cli/winresources/docker-proxy \
     --mount=type=cache,target=/root/.cache/go-build,id=moby-build-$TARGETPLATFORM <<EOT
@@ -615,13 +628,13 @@ COPY --from=build /build/ /
 # usage:
 # > docker buildx bake all
 FROM scratch AS all
-COPY --from=tini          /build/ /
-COPY --from=runc          /build/ /
-COPY --from=containerd    /build/ /
-COPY --from=rootlesskit   /build/ /
-COPY --from=containerutil /build/ /
-COPY --from=vpnkit        /       /
-COPY --from=build         /build  /
+COPY --link --from=tini          /build/ /
+COPY --link --from=runc          /build/ /
+COPY --link --from=containerd    /build/ /
+COPY --link --from=rootlesskit   /build/ /
+COPY --link --from=containerutil /build/ /
+COPY --link --from=vpnkit        /       /
+COPY --link --from=build         /build  /
 
 # smoke tests
 # usage:
@@ -641,4 +654,4 @@ EOT
 # > make shell
 # > SYSTEMD=true make shell
 FROM dev-base AS dev
-COPY . .
+COPY --link . .

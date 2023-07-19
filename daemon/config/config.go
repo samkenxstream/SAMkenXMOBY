@@ -2,20 +2,20 @@ package config // import "github.com/docker/docker/daemon/config"
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 
-	"github.com/containerd/containerd/runtime/v2/shim"
+	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/registry"
 	"github.com/imdario/mergo"
@@ -56,20 +56,12 @@ const (
 	// DefaultPluginNamespace is the name of the default containerd namespace used for plugins.
 	DefaultPluginNamespace = "plugins.moby"
 
-	// LinuxV2RuntimeName is the runtime used to specify the containerd v2 runc shim
-	LinuxV2RuntimeName = "io.containerd.runc.v2"
-
 	// SeccompProfileDefault is the built-in default seccomp profile.
 	SeccompProfileDefault = "builtin"
 	// SeccompProfileUnconfined is a special profile name for seccomp to use an
 	// "unconfined" seccomp profile.
 	SeccompProfileUnconfined = "unconfined"
 )
-
-var builtinRuntimes = map[string]bool{
-	StockRuntimeName:   true,
-	LinuxV2RuntimeName: true,
-}
 
 // flatOptions contains configuration keys
 // that MUST NOT be parsed as deep structures.
@@ -152,22 +144,20 @@ type DNSConfig struct {
 // It includes json tags to deserialize configuration from a file
 // using the same names that the flags in the command line use.
 type CommonConfig struct {
-	AuthorizationPlugins  []string            `json:"authorization-plugins,omitempty"` // AuthorizationPlugins holds list of authorization plugins
-	AutoRestart           bool                `json:"-"`
-	Context               map[string][]string `json:"-"`
-	DisableBridge         bool                `json:"-"`
-	ExecOptions           []string            `json:"exec-opts,omitempty"`
-	GraphDriver           string              `json:"storage-driver,omitempty"`
-	GraphOptions          []string            `json:"storage-opts,omitempty"`
-	Labels                []string            `json:"labels,omitempty"`
-	Mtu                   int                 `json:"mtu,omitempty"`
-	NetworkDiagnosticPort int                 `json:"network-diagnostic-port,omitempty"`
-	Pidfile               string              `json:"pidfile,omitempty"`
-	RawLogs               bool                `json:"raw-logs,omitempty"`
-	Root                  string              `json:"data-root,omitempty"`
-	ExecRoot              string              `json:"exec-root,omitempty"`
-	SocketGroup           string              `json:"group,omitempty"`
-	CorsHeaders           string              `json:"api-cors-header,omitempty"`
+	AuthorizationPlugins  []string `json:"authorization-plugins,omitempty"` // AuthorizationPlugins holds list of authorization plugins
+	AutoRestart           bool     `json:"-"`
+	DisableBridge         bool     `json:"-"`
+	ExecOptions           []string `json:"exec-opts,omitempty"`
+	GraphDriver           string   `json:"storage-driver,omitempty"`
+	GraphOptions          []string `json:"storage-opts,omitempty"`
+	Labels                []string `json:"labels,omitempty"`
+	NetworkDiagnosticPort int      `json:"network-diagnostic-port,omitempty"`
+	Pidfile               string   `json:"pidfile,omitempty"`
+	RawLogs               bool     `json:"raw-logs,omitempty"`
+	Root                  string   `json:"data-root,omitempty"`
+	ExecRoot              string   `json:"exec-root,omitempty"`
+	SocketGroup           string   `json:"group,omitempty"`
+	CorsHeaders           string   `json:"api-cors-header,omitempty"`
 
 	// Proxies holds the proxies that are configured for the daemon.
 	Proxies `json:"proxies"`
@@ -195,6 +185,7 @@ type CommonConfig struct {
 	Debug     bool     `json:"debug,omitempty"`
 	Hosts     []string `json:"hosts,omitempty"`
 	LogLevel  string   `json:"log-level,omitempty"`
+	LogFormat string   `json:"log-format,omitempty"`
 	TLS       *bool    `json:"tls,omitempty"`
 	TLSVerify *bool    `json:"tlsverify,omitempty"`
 
@@ -226,7 +217,6 @@ type CommonConfig struct {
 	NetworkConfig
 	registry.ServiceOptions
 
-	sync.Mutex
 	// FIXME(vdemeester) This part is not that clear and is mainly dependent on cli flags
 	// It should probably be handled outside this package.
 	ValuesSet map[string]interface{} `json:"-"`
@@ -256,6 +246,9 @@ type CommonConfig struct {
 	ContainerdPluginNamespace string `json:"containerd-plugin-namespace,omitempty"`
 
 	DefaultRuntime string `json:"default-runtime,omitempty"`
+
+	// CDISpecDirs is a list of directories in which CDI specifications can be found.
+	CDISpecDirs []string `json:"cdi-spec-dirs,omitempty"`
 }
 
 // Proxies holds the proxies that are configured for the daemon.
@@ -287,7 +280,7 @@ func New() (*Config, error) {
 			MaxConcurrentDownloads: DefaultMaxConcurrentDownloads,
 			MaxConcurrentUploads:   DefaultMaxConcurrentUploads,
 			MaxDownloadAttempts:    DefaultDownloadAttempts,
-			Mtu:                    DefaultNetworkMtu,
+			BridgeConfig:           BridgeConfig{MTU: DefaultNetworkMtu},
 			NetworkConfig: NetworkConfig{
 				NetworkControlPlaneMTU: DefaultNetworkMtu,
 				DefaultNetworkOpts:     make(map[string]map[string]string),
@@ -295,6 +288,7 @@ func New() (*Config, error) {
 			ContainerdNamespace:       DefaultContainersNamespace,
 			ContainerdPluginNamespace: DefaultPluginNamespace,
 			DefaultRuntime:            StockRuntimeName,
+			CDISpecDirs:               append([]string(nil), cdi.DefaultSpecDirs...),
 		},
 	}
 
@@ -331,7 +325,7 @@ func GetConflictFreeLabels(labels []string) ([]string, error) {
 
 // Reload reads the configuration in the host and reloads the daemon and server.
 func Reload(configFile string, flags *pflag.FlagSet, reload func(*Config)) error {
-	logrus.Infof("Got signal to reload configuration, reloading from: %s", configFile)
+	log.G(context.TODO()).Infof("Got signal to reload configuration, reloading from: %s", configFile)
 	newConfig, err := getConflictFreeConfiguration(configFile, flags)
 	if err != nil {
 		if flags.Changed("config-file") || !os.IsNotExist(err) {
@@ -599,6 +593,16 @@ func Validate(config *Config) error {
 		}
 	}
 
+	// validate log-format
+	if logFormat := config.LogFormat; logFormat != "" {
+		switch logFormat {
+		case log.TextFormat, log.JSONFormat:
+			// These are valid
+		default:
+			return errors.Errorf("invalid log format: %s", logFormat)
+		}
+	}
+
 	// validate DNS
 	for _, dns := range config.DNS {
 		if _, err := opts.ValidateIPAddress(dns); err != nil {
@@ -621,8 +625,8 @@ func Validate(config *Config) error {
 	}
 
 	// TODO(thaJeztah) Validations below should not accept "0" to be valid; see Validate() for a more in-depth description of this problem
-	if config.Mtu < 0 {
-		return errors.Errorf("invalid default MTU: %d", config.Mtu)
+	if config.MTU < 0 {
+		return errors.Errorf("invalid default MTU: %d", config.MTU)
 	}
 	if config.MaxConcurrentDownloads < 0 {
 		return errors.Errorf("invalid max concurrent downloads: %d", config.MaxConcurrentDownloads)
@@ -634,24 +638,8 @@ func Validate(config *Config) error {
 		return errors.Errorf("invalid max download attempts: %d", config.MaxDownloadAttempts)
 	}
 
-	// validate that "default" runtime is not reset
-	if runtimes := config.GetAllRuntimes(); len(runtimes) > 0 {
-		if _, ok := runtimes[StockRuntimeName]; ok {
-			return errors.Errorf("runtime name '%s' is reserved", StockRuntimeName)
-		}
-	}
-
 	if _, err := ParseGenericResources(config.NodeGenericResources); err != nil {
 		return err
-	}
-
-	if defaultRuntime := config.GetDefaultRuntimeName(); defaultRuntime != "" {
-		if !builtinRuntimes[defaultRuntime] {
-			runtimes := config.GetAllRuntimes()
-			if _, ok := runtimes[defaultRuntime]; !ok && !IsPermissibleC8dRuntimeName(defaultRuntime) {
-				return errors.Errorf("specified default runtime '%s' does not exist", defaultRuntime)
-			}
-		}
 	}
 
 	for _, h := range config.Hosts {
@@ -664,15 +652,6 @@ func Validate(config *Config) error {
 	return config.ValidatePlatformConfig()
 }
 
-// GetDefaultRuntimeName returns the current default runtime
-func (conf *Config) GetDefaultRuntimeName() string {
-	conf.Lock()
-	rt := conf.DefaultRuntime
-	conf.Unlock()
-
-	return rt
-}
-
 // MaskCredentials masks credentials that are in an URL.
 func MaskCredentials(rawURL string) string {
 	parsedURL, err := url.Parse(rawURL)
@@ -681,38 +660,4 @@ func MaskCredentials(rawURL string) string {
 	}
 	parsedURL.User = url.UserPassword("xxxxx", "xxxxx")
 	return parsedURL.String()
-}
-
-// IsPermissibleC8dRuntimeName tests whether name is safe to pass into
-// containerd as a runtime name, and whether the name is well-formed.
-// It does not check if the runtime is installed.
-//
-// A runtime name containing slash characters is interpreted by containerd as
-// the path to a runtime binary. If we allowed this, anyone with Engine API
-// access could get containerd to execute an arbitrary binary as root. Although
-// Engine API access is already equivalent to root on the host, the runtime name
-// has not historically been a vector to run arbitrary code as root so users are
-// not expecting it to become one.
-//
-// This restriction is not configurable. There are viable workarounds for
-// legitimate use cases: administrators and runtime developers can make runtimes
-// available for use with Docker by installing them onto PATH following the
-// [binary naming convention] for containerd Runtime v2.
-//
-// [binary naming convention]: https://github.com/containerd/containerd/blob/main/runtime/v2/README.md#binary-naming
-func IsPermissibleC8dRuntimeName(name string) bool {
-	// containerd uses a rather permissive test to validate runtime names:
-	//
-	//   - Any name for which filepath.IsAbs(name) is interpreted as the absolute
-	//     path to a shim binary. We want to block this behaviour.
-	//   - Any name which contains at least one '.' character and no '/' characters
-	//     and does not begin with a '.' character is a valid runtime name. The shim
-	//     binary name is derived from the final two components of the name and
-	//     searched for on the PATH. The name "a.." is technically valid per
-	//     containerd's implementation: it would resolve to a binary named
-	//     "containerd-shim---".
-	//
-	// https://github.com/containerd/containerd/blob/11ded166c15f92450958078cd13c6d87131ec563/runtime/v2/manager.go#L297-L317
-	// https://github.com/containerd/containerd/blob/11ded166c15f92450958078cd13c6d87131ec563/runtime/v2/shim/util.go#L83-L93
-	return !filepath.IsAbs(name) && !strings.ContainsRune(name, '/') && shim.BinaryName(name) != ""
 }

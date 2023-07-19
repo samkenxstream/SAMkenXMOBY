@@ -176,7 +176,7 @@ func (s *DockerCLIPsSuite) TestPsListContainersSize(c *testing.T) {
 	select {
 	case <-wait:
 	case <-time.After(3 * time.Second):
-		c.Fatalf("Calling \"docker ps -s\" timed out!")
+		c.Fatalf(`Calling "docker ps -s" timed out!`)
 	}
 	result.Assert(c, icmd.Success)
 	lines := strings.Split(strings.Trim(result.Combined(), "\n "), "\n")
@@ -223,7 +223,7 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterStatus(c *testing.T) {
 		Err:      err,
 	})
 	// Windows doesn't support pausing of containers
-	if testEnv.OSType != "windows" {
+	if testEnv.DaemonInfo.OSType != "windows" {
 		// pause running container
 		out = cli.DockerCmd(c, "run", "-itd", "busybox").Combined()
 		pausedID := strings.TrimSpace(out)
@@ -356,7 +356,7 @@ func (s *DockerCLIPsSuite) TestPsListContainersFilterAncestorImage(c *testing.T)
 	dockerCmd(c, "run", "--name=fifth", imageName2, "echo", "hello")
 	fifthID := getIDByName(c, "fifth")
 
-	var filterTestSuite = []struct {
+	filterTestSuite := []struct {
 		filterName  string
 		expectedIDs []string
 	}{
@@ -634,8 +634,8 @@ func (s *DockerCLIPsSuite) TestPsShowMounts(c *testing.T) {
 	var bindMountSource string
 	var bindMountDestination string
 	if DaemonIsWindows() {
-		bindMountSource = "c:\\"
-		bindMountDestination = "c:\\t"
+		bindMountSource = `c:\`
+		bindMountDestination = `c:\t`
 	} else {
 		bindMountSource = "/tmp"
 		bindMountDestination = "/t"

@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -396,14 +395,14 @@ func (s *DockerDaemonSuite) TestDaemonEvents(c *testing.T) {
 	defer os.Remove(configFilePath)
 
 	daemonConfig := `{"labels":["foo=bar"]}`
-	err := os.WriteFile(configFilePath, []byte(daemonConfig), 0644)
+	err := os.WriteFile(configFilePath, []byte(daemonConfig), 0o644)
 	assert.NilError(c, err)
 	s.d.Start(c, "--config-file="+configFilePath)
 
 	info := s.d.Info(c)
 
 	daemonConfig = `{"max-concurrent-downloads":1,"labels":["bar=foo"], "shutdown-timeout": 10}`
-	err = os.WriteFile(configFilePath, []byte(daemonConfig), 0644)
+	err = os.WriteFile(configFilePath, []byte(daemonConfig), 0o644)
 	assert.NilError(c, err)
 
 	assert.NilError(c, s.d.Signal(unix.SIGHUP))
@@ -415,21 +414,21 @@ func (s *DockerDaemonSuite) TestDaemonEvents(c *testing.T) {
 	// only check for values known (daemon ID/name) or explicitly set above,
 	// otherwise just check for names being present.
 	expectedSubstrings := []string{
-		" daemon reload " + info.ID + " ",
-		"(allow-nondistributable-artifacts=[",
-		" debug=true, ",
-		" default-ipc-mode=",
-		" default-runtime=",
-		" default-shm-size=",
-		" insecure-registries=[",
-		" labels=[\"bar=foo\"], ",
-		" live-restore=",
-		" max-concurrent-downloads=1, ",
-		" max-concurrent-uploads=5, ",
-		" name=" + info.Name,
-		" registry-mirrors=[",
-		" runtimes=",
-		" shutdown-timeout=10)",
+		` daemon reload ` + info.ID + " ",
+		`(allow-nondistributable-artifacts=[`,
+		` debug=true, `,
+		` default-ipc-mode=`,
+		` default-runtime=`,
+		` default-shm-size=`,
+		` insecure-registries=[`,
+		` labels=["bar=foo"], `,
+		` live-restore=`,
+		` max-concurrent-downloads=1, `,
+		` max-concurrent-uploads=5, `,
+		` name=` + info.Name,
+		` registry-mirrors=[`,
+		` runtimes=`,
+		` shutdown-timeout=10)`,
 	}
 
 	for _, s := range expectedSubstrings {
@@ -443,7 +442,7 @@ func (s *DockerDaemonSuite) TestDaemonEventsWithFilters(c *testing.T) {
 	defer os.Remove(configFilePath)
 
 	daemonConfig := `{"labels":["foo=bar"]}`
-	err := os.WriteFile(configFilePath, []byte(daemonConfig), 0644)
+	err := os.WriteFile(configFilePath, []byte(daemonConfig), 0o644)
 	assert.NilError(c, err)
 	s.d.Start(c, "--config-file="+configFilePath)
 

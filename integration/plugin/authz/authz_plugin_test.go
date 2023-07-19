@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package authz // import "github.com/docker/docker/integration/plugin/authz"
 
@@ -56,11 +55,11 @@ func setupTestV1(t *testing.T) func() {
 	ctrl = &authorizationController{}
 	teardown := setupTest(t)
 
-	err := os.MkdirAll("/etc/docker/plugins", 0755)
+	err := os.MkdirAll("/etc/docker/plugins", 0o755)
 	assert.NilError(t, err)
 
 	fileName := fmt.Sprintf("/etc/docker/plugins/%s.spec", testAuthZPlugin)
-	err = os.WriteFile(fileName, []byte(server.URL), 0644)
+	err = os.WriteFile(fileName, []byte(server.URL), 0o644)
 	assert.NilError(t, err)
 
 	return func() {

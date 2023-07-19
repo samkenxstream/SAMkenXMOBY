@@ -5,14 +5,18 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
 	containerddefaults "github.com/containerd/containerd/defaults"
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/api"
 	apiserver "github.com/docker/docker/api/server"
 	buildbackend "github.com/docker/docker/api/server/backend/build"
@@ -65,17 +69,23 @@ type DaemonCli struct {
 	configFile *string
 	flags      *pflag.FlagSet
 
-	api             apiserver.Server
 	d               *daemon.Daemon
 	authzMiddleware *authorization.Middleware // authzMiddleware enables to dynamically reload the authorization plugins
+
+	stopOnce    sync.Once
+	apiShutdown chan struct{}
 }
 
 // NewDaemonCli returns a daemon CLI
 func NewDaemonCli() *DaemonCli {
-	return &DaemonCli{}
+	return &DaemonCli{
+		apiShutdown: make(chan struct{}),
+	}
 }
 
 func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
+	ctx := context.TODO()
+
 	if cli.Config, err = loadDaemonCliConfig(opts); err != nil {
 		return err
 	}
@@ -94,7 +104,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	configureProxyEnv(cli.Config)
 	configureDaemonLogs(cli.Config)
 
-	logrus.Info("Starting up")
+	log.G(ctx).Info("Starting up")
 
 	cli.configFile = &opts.configFile
 	cli.flags = opts.flags
@@ -104,14 +114,14 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	}
 
 	if cli.Config.Experimental {
-		logrus.Warn("Running experimental build")
+		log.G(ctx).Warn("Running experimental build")
 	}
 
 	if cli.Config.IsRootless() {
-		logrus.Warn("Running in rootless mode. This mode has feature limitations.")
+		log.G(ctx).Warn("Running in rootless mode. This mode has feature limitations.")
 	}
 	if rootless.RunningWithRootlessKit() {
-		logrus.Info("Running with RootlessKit integration")
+		log.G(ctx).Info("Running with RootlessKit integration")
 		if !cli.Config.IsRootless() {
 			return fmt.Errorf("rootless mode needs to be enabled for running with RootlessKit")
 		}
@@ -132,7 +142,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		return err
 	}
 
-	if err := system.MkdirAll(cli.Config.ExecRoot, 0700); err != nil {
+	if err := system.MkdirAll(cli.Config.ExecRoot, 0o700); err != nil {
 		return err
 	}
 
@@ -148,7 +158,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		potentiallyUnderRuntimeDir = append(potentiallyUnderRuntimeDir, cli.Pidfile)
 		defer func() {
 			if err := os.Remove(cli.Pidfile); err != nil {
-				logrus.Error(err)
+				log.G(ctx).Error(err)
 			}
 		}()
 	}
@@ -157,11 +167,11 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		// Set sticky bit if XDG_RUNTIME_DIR is set && the file is actually under XDG_RUNTIME_DIR
 		if _, err := homedir.StickRuntimeDirContents(potentiallyUnderRuntimeDir); err != nil {
 			// StickRuntimeDirContents returns nil error if XDG_RUNTIME_DIR is just unset
-			logrus.WithError(err).Warn("cannot set sticky bit on files under XDG_RUNTIME_DIR")
+			log.G(ctx).WithError(err).Warn("cannot set sticky bit on files under XDG_RUNTIME_DIR")
 		}
 	}
 
-	hosts, err := loadListeners(cli, tlsConfig)
+	lss, hosts, err := loadListeners(cli.Config, tlsConfig)
 	if err != nil {
 		return errors.Wrap(err, "failed to load listeners")
 	}
@@ -177,20 +187,51 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	}
 	defer cancel()
 
-	stopc := make(chan bool)
-	defer close(stopc)
-
-	trap.Trap(func() {
-		cli.stop()
-		<-stopc // wait for daemonCli.start() to return
-	}, logrus.StandardLogger())
+	httpServer := &http.Server{
+		ReadHeaderTimeout: 5 * time.Minute, // "G112: Potential Slowloris Attack (gosec)"; not a real concern for our use, so setting a long timeout.
+	}
+	apiShutdownCtx, apiShutdownCancel := context.WithCancel(context.Background())
+	apiShutdownDone := make(chan struct{})
+	trap.Trap(cli.stop)
+	go func() {
+		// Block until cli.stop() has been called.
+		// It may have already been called, and that's okay.
+		// Any httpServer.Serve() calls made after
+		// httpServer.Shutdown() will return immediately,
+		// which is what we want.
+		<-cli.apiShutdown
+		err := httpServer.Shutdown(apiShutdownCtx)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("Error shutting down http server")
+		}
+		close(apiShutdownDone)
+	}()
+	defer func() {
+		select {
+		case <-cli.apiShutdown:
+			// cli.stop() has been called and the daemon has completed
+			// shutting down. Give the HTTP server a little more time to
+			// finish handling any outstanding requests if needed.
+			tmr := time.AfterFunc(5*time.Second, apiShutdownCancel)
+			defer tmr.Stop()
+			<-apiShutdownDone
+		default:
+			// cli.start() has returned without cli.stop() being called,
+			// e.g. because the daemon failed to start.
+			// Stop the HTTP server with no grace period.
+			if closeErr := httpServer.Close(); closeErr != nil {
+				log.G(ctx).WithError(closeErr).Error("Error closing http server")
+			}
+		}
+	}()
 
 	// Notify that the API is active, but before daemon is set up.
 	preNotifyReady()
 
 	pluginStore := plugin.NewStore()
 
-	cli.authzMiddleware = initMiddlewares(&cli.api, cli.Config, pluginStore)
+	var apiServer apiserver.Server
+	cli.authzMiddleware = initMiddlewares(&apiServer, cli.Config, pluginStore)
 
 	d, err := daemon.NewDaemon(ctx, cli.Config, pluginStore, cli.authzMiddleware)
 	if err != nil {
@@ -204,6 +245,18 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		return errors.Wrap(err, "failed to validate authorization plugin")
 	}
 
+	// Note that CDI is not inherrently linux-specific, there are some linux-specific assumptions / implementations in the code that
+	// queries the properties of device on the host as wel as performs the injection of device nodes and their access permissions into the OCI spec.
+	//
+	// In order to lift this restriction the following would have to be addressed:
+	// - Support needs to be added to the cdi package for injecting Windows devices: https://github.com/container-orchestrated-devices/container-device-interface/issues/28
+	// - The DeviceRequests API must be extended to non-linux platforms.
+	if runtime.GOOS == "linux" && cli.Config.Experimental {
+		daemon.RegisterCDIDriver(
+			cdi.WithSpecDirs(cli.Config.CDISpecDirs...),
+		)
+	}
+
 	cli.d = d
 
 	if err := startMetricsServer(cli.Config.MetricsAddress); err != nil {
@@ -212,7 +265,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	c, err := createAndStartCluster(cli, d)
 	if err != nil {
-		logrus.Fatalf("Error starting cluster component: %v", err)
+		log.G(ctx).Fatalf("Error starting cluster component: %v", err)
 	}
 
 	// Restart all autostart containers which has a swarm endpoint
@@ -220,7 +273,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	// initialized the cluster.
 	d.RestartSwarmContainers()
 
-	logrus.Info("Daemon has completed initialization")
+	log.G(ctx).Info("Daemon has completed initialization")
 
 	routerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -229,10 +282,9 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	if err != nil {
 		return err
 	}
-	routerOptions.api = &cli.api
 	routerOptions.cluster = c
 
-	initRouter(routerOptions)
+	httpServer.Handler = apiServer.CreateMux(routerOptions.Build()...)
 
 	go d.ProcessClusterNotifications(ctx, c.GetWatchStream())
 
@@ -243,10 +295,30 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	// Daemon is fully initialized. Start handling API traffic
 	// and wait for serve API to complete.
-	errAPI := cli.api.Serve()
-	if errAPI != nil {
-		logrus.WithError(errAPI).Error("ServeAPI error")
+	var (
+		apiWG  sync.WaitGroup
+		errAPI = make(chan error, 1)
+	)
+	for _, ls := range lss {
+		apiWG.Add(1)
+		go func(ls net.Listener) {
+			defer apiWG.Done()
+			log.G(ctx).Infof("API listen on %s", ls.Addr())
+			if err := httpServer.Serve(ls); err != http.ErrServerClosed {
+				log.G(ctx).WithFields(logrus.Fields{
+					logrus.ErrorKey: err,
+					"listener":      ls.Addr(),
+				}).Error("ServeAPI error")
+
+				select {
+				case errAPI <- err:
+				default:
+				}
+			}
+		}(ls)
 	}
+	apiWG.Wait()
+	close(errAPI)
 
 	c.Cleanup()
 
@@ -257,21 +329,20 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	// Stop notification processing and any background processes
 	cancel()
 
-	if errAPI != nil {
-		return errors.Wrap(errAPI, "shutting down due to ServeAPI error")
+	if err, ok := <-errAPI; ok {
+		return errors.Wrap(err, "shutting down due to ServeAPI error")
 	}
 
-	logrus.Info("Daemon shutdown complete")
+	log.G(ctx).Info("Daemon shutdown complete")
 	return nil
 }
 
 type routerOptions struct {
 	sessionManager *session.Manager
 	buildBackend   *buildbackend.Backend
-	features       *map[string]bool
+	features       func() map[string]bool
 	buildkit       *buildkit.Builder
 	daemon         *daemon.Daemon
-	api            *apiserver.Server
 	cluster        *cluster.Cluster
 }
 
@@ -289,19 +360,21 @@ func newRouterOptions(ctx context.Context, config *config.Config, d *daemon.Daem
 	cgroupParent := newCgroupParent(config)
 	ro := routerOptions{
 		sessionManager: sm,
-		features:       d.Features(),
+		features:       d.Features,
 		daemon:         d,
 	}
 
 	bk, err := buildkit.New(ctx, buildkit.Opt{
 		SessionManager:      sm,
 		Root:                filepath.Join(config.Root, "buildkit"),
+		EngineID:            d.ID(),
 		Dist:                d.DistributionServices(),
+		ImageTagger:         d.ImageService(),
 		NetworkController:   d.NetworkController(),
 		DefaultCgroupParent: cgroupParent,
-		RegistryHosts:       d.RegistryHosts(),
+		RegistryHosts:       d.RegistryHosts,
 		BuilderConfig:       config.Builder,
-		Rootless:            d.Rootless(),
+		Rootless:            daemon.Rootless(config),
 		IdentityMapping:     d.IdentityMapping(),
 		DNSConfig:           config.DNSConfig,
 		ApparmorProfile:     daemon.DefaultApparmorProfile(),
@@ -326,18 +399,22 @@ func newRouterOptions(ctx context.Context, config *config.Config, d *daemon.Daem
 }
 
 func (cli *DaemonCli) reloadConfig() {
+	ctx := context.TODO()
 	reload := func(c *config.Config) {
-		// Revalidate and reload the authorization plugins
 		if err := validateAuthzPlugins(c.AuthorizationPlugins, cli.d.PluginStore); err != nil {
-			logrus.Fatalf("Error validating authorization plugin: %v", err)
+			log.G(ctx).Fatalf("Error validating authorization plugin: %v", err)
 			return
 		}
-		cli.authzMiddleware.SetPlugins(c.AuthorizationPlugins)
 
 		if err := cli.d.Reload(c); err != nil {
-			logrus.Errorf("Error reconfiguring the daemon: %v", err)
+			log.G(ctx).Errorf("Error reconfiguring the daemon: %v", err)
 			return
 		}
+
+		// Apply our own configuration only after the daemon reload has succeeded. We
+		// don't want to partially apply the config if the daemon is unhappy with it.
+
+		cli.authzMiddleware.SetPlugins(c.AuthorizationPlugins)
 
 		if c.IsValueSet("debug") {
 			debugEnabled := debug.IsEnabled()
@@ -351,12 +428,19 @@ func (cli *DaemonCli) reloadConfig() {
 	}
 
 	if err := config.Reload(*cli.configFile, cli.flags, reload); err != nil {
-		logrus.Error(err)
+		log.G(ctx).Error(err)
 	}
 }
 
 func (cli *DaemonCli) stop() {
-	cli.api.Close()
+	// Signal that the API server should shut down as soon as possible.
+	// This construct is used rather than directly shutting down the HTTP
+	// server to avoid any issues if this method is called before the server
+	// has been instantiated in cli.start(). If this method is called first,
+	// the HTTP server will be shut down immediately upon instantiation.
+	cli.stopOnce.Do(func() {
+		close(cli.apiShutdown)
+	})
 }
 
 // shutdownDaemon just wraps daemon.Shutdown() to handle a timeout in case
@@ -377,9 +461,9 @@ func shutdownDaemon(ctx context.Context, d *daemon.Daemon) {
 
 	<-ctx.Done()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		logrus.Error("Force shutdown daemon")
+		log.G(ctx).Error("Force shutdown daemon")
 	} else {
-		logrus.Debug("Clean shutdown succeeded")
+		log.G(ctx).Debug("Clean shutdown succeeded")
 	}
 }
 
@@ -394,6 +478,7 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 	conf.Debug = opts.Debug
 	conf.Hosts = opts.Hosts
 	conf.LogLevel = opts.LogLevel
+	conf.LogFormat = opts.LogFormat
 
 	if flags.Changed(FlagTLS) {
 		conf.TLS = &opts.TLS
@@ -498,7 +583,7 @@ func normalizeHosts(config *config.Config) error {
 	return nil
 }
 
-func initRouter(opts routerOptions) {
+func (opts routerOptions) Build() []router.Router {
 	decoder := runconfig.ContainerDecoder{
 		GetSysInfo: func() *sysinfo.SysInfo {
 			return opts.daemon.RawSysInfo()
@@ -516,13 +601,13 @@ func initRouter(opts routerOptions) {
 			opts.daemon.ImageService().DistributionServices().ImageStore,
 			opts.daemon.ImageService().DistributionServices().LayerStore,
 		),
-		systemrouter.NewRouter(opts.daemon, opts.cluster, opts.buildkit, opts.features),
+		systemrouter.NewRouter(opts.daemon, opts.cluster, opts.buildkit, opts.daemon.Features),
 		volume.NewRouter(opts.daemon.VolumesService(), opts.cluster),
-		build.NewRouter(opts.buildBackend, opts.daemon, opts.features),
+		build.NewRouter(opts.buildBackend, opts.daemon),
 		sessionrouter.NewRouter(opts.sessionManager),
 		swarmrouter.NewRouter(opts.cluster),
 		pluginrouter.NewRouter(opts.daemon.PluginManager()),
-		distributionrouter.NewRouter(opts.daemon.ImageService()),
+		distributionrouter.NewRouter(opts.daemon.ImageBackend()),
 	}
 
 	if opts.buildBackend != nil {
@@ -543,7 +628,7 @@ func initRouter(opts routerOptions) {
 		}
 	}
 
-	opts.api.InitRouter(routers...)
+	return routers
 }
 
 func initMiddlewares(s *apiserver.Server, cfg *config.Config, pluginStore plugingetter.PluginGetter) *authorization.Middleware {
@@ -566,15 +651,15 @@ func initMiddlewares(s *apiserver.Server, cfg *config.Config, pluginStore plugin
 }
 
 func (cli *DaemonCli) getContainerdDaemonOpts() ([]supervisor.DaemonOpt, error) {
-	opts, err := cli.getPlatformContainerdDaemonOpts()
-	if err != nil {
-		return nil, err
-	}
-
+	var opts []supervisor.DaemonOpt
 	if cli.Debug {
 		opts = append(opts, supervisor.WithLogLevel("debug"))
 	} else {
 		opts = append(opts, supervisor.WithLogLevel(cli.LogLevel))
+	}
+
+	if logFormat := cli.Config.LogFormat; logFormat != "" {
+		opts = append(opts, supervisor.WithLogFormat(logFormat))
 	}
 
 	if !cli.CriContainerd {
@@ -647,32 +732,37 @@ func checkTLSAuthOK(c *config.Config) bool {
 	return true
 }
 
-func loadListeners(cli *DaemonCli, tlsConfig *tls.Config) ([]string, error) {
-	if len(cli.Config.Hosts) == 0 {
-		return nil, errors.New("no hosts configured")
-	}
-	var hosts []string
+func loadListeners(cfg *config.Config, tlsConfig *tls.Config) ([]net.Listener, []string, error) {
+	ctx := context.TODO()
 
-	for i := 0; i < len(cli.Config.Hosts); i++ {
-		protoAddr := cli.Config.Hosts[i]
+	if len(cfg.Hosts) == 0 {
+		return nil, nil, errors.New("no hosts configured")
+	}
+	var (
+		hosts []string
+		lss   []net.Listener
+	)
+
+	for i := 0; i < len(cfg.Hosts); i++ {
+		protoAddr := cfg.Hosts[i]
 		proto, addr, ok := strings.Cut(protoAddr, "://")
 		if !ok {
-			return nil, fmt.Errorf("bad format %s, expected PROTO://ADDR", protoAddr)
+			return nil, nil, fmt.Errorf("bad format %s, expected PROTO://ADDR", protoAddr)
 		}
 
 		// It's a bad idea to bind to TCP without tlsverify.
 		authEnabled := tlsConfig != nil && tlsConfig.ClientAuth == tls.RequireAndVerifyClientCert
 		if proto == "tcp" && !authEnabled {
-			logrus.WithField("host", protoAddr).Warn("Binding to IP address without --tlsverify is insecure and gives root access on this machine to everyone who has access to your network.")
-			logrus.WithField("host", protoAddr).Warn("Binding to an IP address, even on localhost, can also give access to scripts run in a browser. Be safe out there!")
+			log.G(ctx).WithField("host", protoAddr).Warn("Binding to IP address without --tlsverify is insecure and gives root access on this machine to everyone who has access to your network.")
+			log.G(ctx).WithField("host", protoAddr).Warn("Binding to an IP address, even on localhost, can also give access to scripts run in a browser. Be safe out there!")
 			time.Sleep(time.Second)
 
 			// If TLSVerify is explicitly set to false we'll take that as "Please let me shoot myself in the foot"
 			// We do not want to continue to support a default mode where tls verification is disabled, so we do some extra warnings here and eventually remove support
-			if !checkTLSAuthOK(cli.Config) {
+			if !checkTLSAuthOK(cfg) {
 				ipAddr, _, err := net.SplitHostPort(addr)
 				if err != nil {
-					return nil, errors.Wrap(err, "error parsing tcp address")
+					return nil, nil, errors.Wrap(err, "error parsing tcp address")
 				}
 
 				// shortcut all this extra stuff for literal "localhost"
@@ -682,17 +772,17 @@ func loadListeners(cli *DaemonCli, tlsConfig *tls.Config) ([]string, error) {
 					if ip == nil {
 						ipA, err := net.ResolveIPAddr("ip", ipAddr)
 						if err != nil {
-							logrus.WithError(err).WithField("host", ipAddr).Error("Error looking up specified host address")
+							log.G(ctx).WithError(err).WithField("host", ipAddr).Error("Error looking up specified host address")
 						}
 						if ipA != nil {
 							ip = ipA.IP
 						}
 					}
 					if ip == nil || !ip.IsLoopback() {
-						logrus.WithField("host", protoAddr).Warn("Binding to an IP address without --tlsverify is deprecated. Startup is intentionally being slowed down to show this message")
-						logrus.WithField("host", protoAddr).Warn("Please consider generating tls certificates with client validation to prevent exposing unauthenticated root access to your network")
-						logrus.WithField("host", protoAddr).Warnf("You can override this by explicitly specifying '--%s=false' or '--%s=false'", FlagTLS, FlagTLSVerify)
-						logrus.WithField("host", protoAddr).Warnf("Support for listening on TCP without authentication or explicit intent to run without authentication will be removed in the next release")
+						log.G(ctx).WithField("host", protoAddr).Warn("Binding to an IP address without --tlsverify is deprecated. Startup is intentionally being slowed down to show this message")
+						log.G(ctx).WithField("host", protoAddr).Warn("Please consider generating tls certificates with client validation to prevent exposing unauthenticated root access to your network")
+						log.G(ctx).WithField("host", protoAddr).Warnf("You can override this by explicitly specifying '--%s=false' or '--%s=false'", FlagTLS, FlagTLSVerify)
+						log.G(ctx).WithField("host", protoAddr).Warnf("Support for listening on TCP without authentication or explicit intent to run without authentication will be removed in the next release")
 
 						time.Sleep(15 * time.Second)
 					}
@@ -702,19 +792,19 @@ func loadListeners(cli *DaemonCli, tlsConfig *tls.Config) ([]string, error) {
 		// If we're binding to a TCP port, make sure that a container doesn't try to use it.
 		if proto == "tcp" {
 			if err := allocateDaemonPort(addr); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
-		ls, err := listeners.Init(proto, addr, cli.Config.SocketGroup, tlsConfig)
+		ls, err := listeners.Init(proto, addr, cfg.SocketGroup, tlsConfig)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		logrus.Debugf("Listener created for HTTP on %s (%s)", proto, addr)
+		log.G(ctx).Debugf("Listener created for HTTP on %s (%s)", proto, addr)
 		hosts = append(hosts, addr)
-		cli.api.Accept(addr, ls...)
+		lss = append(lss, ls...)
 	}
 
-	return hosts, nil
+	return lss, hosts, nil
 }
 
 func createAndStartCluster(cli *DaemonCli, d *daemon.Daemon) (*cluster.Cluster, error) {
@@ -729,7 +819,7 @@ func createAndStartCluster(cli *DaemonCli, d *daemon.Daemon) (*cluster.Cluster, 
 		Name:                   name,
 		Backend:                d,
 		VolumeBackend:          d.VolumesService(),
-		ImageBackend:           d.ImageService(),
+		ImageBackend:           d.ImageBackend(),
 		PluginBackend:          d.PluginManager(),
 		NetworkSubnetsProvider: d,
 		DefaultAdvertiseAddr:   cli.Config.SwarmDefaultAdvertiseAddr,
@@ -782,11 +872,26 @@ func configureDaemonLogs(conf *config.Config) {
 	} else {
 		logrus.SetLevel(logrus.InfoLevel)
 	}
-	logrus.SetFormatter(&logrus.TextFormatter{
-		TimestampFormat: jsonmessage.RFC3339NanoFixed,
-		DisableColors:   conf.RawLogs,
-		FullTimestamp:   true,
-	})
+	logFormat := conf.LogFormat
+	if logFormat == "" {
+		logFormat = log.TextFormat
+	}
+	var formatter logrus.Formatter
+	switch logFormat {
+	case log.JSONFormat:
+		formatter = &logrus.JSONFormatter{
+			TimestampFormat: jsonmessage.RFC3339NanoFixed,
+		}
+	case log.TextFormat:
+		formatter = &logrus.TextFormatter{
+			TimestampFormat: jsonmessage.RFC3339NanoFixed,
+			DisableColors:   conf.RawLogs,
+			FullTimestamp:   true,
+		}
+	default:
+		panic("unsupported log format " + logFormat)
+	}
+	logrus.SetFormatter(formatter)
 }
 
 func configureProxyEnv(conf *config.Config) {
@@ -806,7 +911,7 @@ func configureProxyEnv(conf *config.Config) {
 
 func overrideProxyEnv(name, val string) {
 	if oldVal := os.Getenv(name); oldVal != "" && oldVal != val {
-		logrus.WithFields(logrus.Fields{
+		log.G(context.TODO()).WithFields(logrus.Fields{
 			"name":      name,
 			"old-value": config.MaskCredentials(oldVal),
 			"new-value": config.MaskCredentials(val),

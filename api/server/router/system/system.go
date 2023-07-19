@@ -2,7 +2,9 @@ package system // import "github.com/docker/docker/api/server/router/system"
 
 import (
 	"github.com/docker/docker/api/server/router"
+	"github.com/docker/docker/api/types/system"
 	buildkit "github.com/docker/docker/builder/builder-next"
+	"resenje.org/singleflight"
 )
 
 // systemRouter provides information about the Docker system overall.
@@ -12,11 +14,16 @@ type systemRouter struct {
 	cluster  ClusterBackend
 	routes   []router.Route
 	builder  *buildkit.Builder
-	features *map[string]bool
+	features func() map[string]bool
+
+	// collectSystemInfo is a single-flight for the /info endpoint,
+	// unique per API version (as different API versions may return
+	// a different API response).
+	collectSystemInfo singleflight.Group[string, *system.Info]
 }
 
 // NewRouter initializes a new system router
-func NewRouter(b Backend, c ClusterBackend, builder *buildkit.Builder, features *map[string]bool) router.Router {
+func NewRouter(b Backend, c ClusterBackend, builder *buildkit.Builder, features func() map[string]bool) router.Router {
 	r := &systemRouter{
 		backend:  b,
 		cluster:  c,

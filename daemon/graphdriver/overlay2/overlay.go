@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package overlay2 // import "github.com/docker/docker/daemon/graphdriver/overlay2"
 
@@ -15,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/daemon/graphdriver/overlayutils"
@@ -29,14 +29,11 @@ import (
 	"github.com/moby/locker"
 	"github.com/moby/sys/mount"
 	"github.com/opencontainers/selinux/go-selinux/label"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
-var (
-	// untar defines the untar method
-	untar = chrootarchive.UntarUncompressed
-)
+// untar defines the untar method
+var untar = chrootarchive.UntarUncompressed
 
 // This backend uses the overlay union filesystem for containers
 // with diff directories for each layer.
@@ -103,7 +100,7 @@ type Driver struct {
 }
 
 var (
-	logger                = logrus.WithField("storage-driver", "overlay2")
+	logger                = log.G(context.TODO()).WithField("storage-driver", "overlay2")
 	backingFs             = "<unknown>"
 	projectQuotaSupported = false
 
@@ -169,10 +166,10 @@ func Init(home string, options []string, idMap idtools.IdentityMapping) (graphdr
 		UID: cur.UID,
 		GID: idMap.RootPair().GID,
 	}
-	if err := idtools.MkdirAllAndChown(home, 0710, dirID); err != nil {
+	if err := idtools.MkdirAllAndChown(home, 0o710, dirID); err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAllAndChown(path.Join(home, linkDir), 0700, cur); err != nil {
+	if err := idtools.MkdirAllAndChown(path.Join(home, linkDir), 0o700, cur); err != nil {
 		return nil, err
 	}
 
@@ -234,9 +231,6 @@ func parseOptions(options []string) (*overlayOptions, error) {
 		}
 		key = strings.ToLower(key)
 		switch key {
-		case "overlay2.override_kernel_check":
-			// TODO(thaJeztah): change this to an error, see https://github.com/docker/cli/pull/3806
-			logger.Warn("DEPRECATED: the overlay2.override_kernel_check option is ignored and will be removed in the next release. You can safely remove this option from your configuration.")
 		case "overlay2.size":
 			size, err := units.RAMInBytes(val)
 			if err != nil {
@@ -351,10 +345,10 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		GID: root.GID,
 	}
 
-	if err := idtools.MkdirAllAndChown(path.Dir(dir), 0710, dirID); err != nil {
+	if err := idtools.MkdirAllAndChown(path.Dir(dir), 0o710, dirID); err != nil {
 		return err
 	}
-	if err := idtools.MkdirAndChown(dir, 0710, dirID); err != nil {
+	if err := idtools.MkdirAndChown(dir, 0o710, dirID); err != nil {
 		return err
 	}
 
@@ -379,7 +373,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		}
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, diffDirName), 0755, root); err != nil {
+	if err := idtools.MkdirAndChown(path.Join(dir, diffDirName), 0o755, root); err != nil {
 		return err
 	}
 
@@ -389,7 +383,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 	}
 
 	// Write link id to link file
-	if err := os.WriteFile(path.Join(dir, "link"), []byte(lid), 0644); err != nil {
+	if err := os.WriteFile(path.Join(dir, "link"), []byte(lid), 0o644); err != nil {
 		return err
 	}
 
@@ -398,11 +392,11 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return nil
 	}
 
-	if err := idtools.MkdirAndChown(path.Join(dir, workDirName), 0700, root); err != nil {
+	if err := idtools.MkdirAndChown(path.Join(dir, workDirName), 0o700, root); err != nil {
 		return err
 	}
 
-	if err := os.WriteFile(path.Join(d.dir(parent), "committed"), []byte{}, 0600); err != nil {
+	if err := os.WriteFile(path.Join(d.dir(parent), "committed"), []byte{}, 0o600); err != nil {
 		return err
 	}
 
@@ -411,7 +405,7 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 		return err
 	}
 	if lower != "" {
-		if err := os.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0666); err != nil {
+		if err := os.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0o666); err != nil {
 			return err
 		}
 	}
@@ -571,7 +565,7 @@ func (d *Driver) Get(id, mountLabel string) (_ string, retErr error) {
 	mountTarget := mergedDir
 
 	root := d.idMap.RootPair()
-	if err := idtools.MkdirAndChown(mergedDir, 0700, root); err != nil {
+	if err := idtools.MkdirAndChown(mergedDir, 0o700, root); err != nil {
 		return "", err
 	}
 

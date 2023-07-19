@@ -67,7 +67,7 @@ func TestRunContainerWithBridgeNone(t *testing.T) {
 // TestNetworkInvalidJSON tests that POST endpoints that expect a body return
 // the correct error when sending invalid JSON requests.
 func TestNetworkInvalidJSON(t *testing.T) {
-	defer setupTest(t)()
+	t.Cleanup(setupTest(t))
 
 	// POST endpoints that accept / expect a JSON body;
 	endpoints := []string{
@@ -126,7 +126,7 @@ func TestNetworkInvalidJSON(t *testing.T) {
 // TestNetworkList verifies that /networks returns a list of networks either
 // with, or without a trailing slash (/networks/). Regression test for https://github.com/moby/moby/issues/24595
 func TestNetworkList(t *testing.T) {
-	defer setupTest(t)()
+	t.Cleanup(setupTest(t))
 
 	endpoints := []string{
 		"/networks",
@@ -153,7 +153,7 @@ func TestNetworkList(t *testing.T) {
 }
 
 func TestHostIPv4BridgeLabel(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
 	d := daemon.New(t)
@@ -179,7 +179,7 @@ func TestHostIPv4BridgeLabel(t *testing.T) {
 }
 
 func TestDefaultNetworkOpts(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
 

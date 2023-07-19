@@ -1,9 +1,11 @@
 package convert // import "github.com/docker/docker/daemon/cluster/convert"
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/api/types/container"
 	mounttypes "github.com/docker/docker/api/types/mount"
 	types "github.com/docker/docker/api/types/swarm"
@@ -11,7 +13,6 @@ import (
 	gogotypes "github.com/gogo/protobuf/types"
 	swarmapi "github.com/moby/swarmkit/v2/api"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 func containerSpecFromGRPC(c *swarmapi.ContainerSpec) *types.ContainerSpec {
@@ -81,8 +82,11 @@ func containerSpecFromGRPC(c *swarmapi.ContainerSpec) *types.ContainerSpec {
 
 		if m.BindOptions != nil {
 			mount.BindOptions = &mounttypes.BindOptions{
-				Propagation:  mounttypes.Propagation(strings.ToLower(swarmapi.Mount_BindOptions_MountPropagation_name[int32(m.BindOptions.Propagation)])),
-				NonRecursive: m.BindOptions.NonRecursive,
+				Propagation:            mounttypes.Propagation(strings.ToLower(swarmapi.Mount_BindOptions_MountPropagation_name[int32(m.BindOptions.Propagation)])),
+				NonRecursive:           m.BindOptions.NonRecursive,
+				CreateMountpoint:       m.BindOptions.CreateMountpoint,
+				ReadOnlyNonRecursive:   m.BindOptions.ReadOnlyNonRecursive,
+				ReadOnlyForceRecursive: m.BindOptions.ReadOnlyForceRecursive,
 			}
 		}
 
@@ -165,7 +169,7 @@ func secretReferencesFromGRPC(sr []*swarmapi.SecretReference) []*types.SecretRef
 		target := s.GetFile()
 		if target == nil {
 			// not a file target
-			logrus.Warnf("secret target not a file: secret=%s", s.SecretID)
+			log.G(context.TODO()).Warnf("secret target not a file: secret=%s", s.SecretID)
 			continue
 		}
 		refs = append(refs, &types.SecretReference{
@@ -237,7 +241,7 @@ func configReferencesFromGRPC(sr []*swarmapi.ConfigReference) []*types.ConfigRef
 			}
 		} else {
 			// not a file target
-			logrus.Warnf("config target not known: config=%s", s.ConfigID)
+			log.G(context.TODO()).Warnf("config target not known: config=%s", s.ConfigID)
 			continue
 		}
 		refs = append(refs, r)
@@ -432,22 +436,25 @@ func healthConfigFromGRPC(h *swarmapi.HealthConfig) *container.HealthConfig {
 	interval, _ := gogotypes.DurationFromProto(h.Interval)
 	timeout, _ := gogotypes.DurationFromProto(h.Timeout)
 	startPeriod, _ := gogotypes.DurationFromProto(h.StartPeriod)
+	startInterval, _ := gogotypes.DurationFromProto(h.StartInterval)
 	return &container.HealthConfig{
-		Test:        h.Test,
-		Interval:    interval,
-		Timeout:     timeout,
-		Retries:     int(h.Retries),
-		StartPeriod: startPeriod,
+		Test:          h.Test,
+		Interval:      interval,
+		Timeout:       timeout,
+		Retries:       int(h.Retries),
+		StartPeriod:   startPeriod,
+		StartInterval: startInterval,
 	}
 }
 
 func healthConfigToGRPC(h *container.HealthConfig) *swarmapi.HealthConfig {
 	return &swarmapi.HealthConfig{
-		Test:        h.Test,
-		Interval:    gogotypes.DurationProto(h.Interval),
-		Timeout:     gogotypes.DurationProto(h.Timeout),
-		Retries:     int32(h.Retries),
-		StartPeriod: gogotypes.DurationProto(h.StartPeriod),
+		Test:          h.Test,
+		Interval:      gogotypes.DurationProto(h.Interval),
+		Timeout:       gogotypes.DurationProto(h.Timeout),
+		Retries:       int32(h.Retries),
+		StartPeriod:   gogotypes.DurationProto(h.StartPeriod),
+		StartInterval: gogotypes.DurationProto(h.StartInterval),
 	}
 }
 

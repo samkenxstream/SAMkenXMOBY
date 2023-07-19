@@ -13,6 +13,7 @@ import (
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
+	"github.com/opencontainers/go-digest"
 )
 
 // MockBackend implements the builder.Backend interface for unit testing
@@ -80,7 +81,7 @@ func (m *MockBackend) MakeImageCache(ctx context.Context, cacheFrom []string) (b
 	return nil, nil
 }
 
-func (m *MockBackend) CreateImage(config []byte, parent string) (builder.Image, error) {
+func (m *MockBackend) CreateImage(ctx context.Context, config []byte, parent string, layerDigest digest.Digest) (builder.Image, error) {
 	return &mockImage{id: "test"}, nil
 }
 
@@ -119,6 +120,10 @@ func (mic *mockImageCache) GetCache(parentID string, cfg *container.Config) (str
 
 type mockLayer struct{}
 
+func (l *mockLayer) ContentStoreDigest() digest.Digest {
+	return ""
+}
+
 func (l *mockLayer) Release() error {
 	return nil
 }
@@ -131,8 +136,7 @@ func (l *mockLayer) DiffID() layer.DiffID {
 	return "abcdef"
 }
 
-type mockRWLayer struct {
-}
+type mockRWLayer struct{}
 
 func (l *mockRWLayer) Release() error {
 	return nil

@@ -2,16 +2,16 @@ package containerd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/containerd/containerd/content"
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/log"
 	cplatforms "github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution/reference"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -25,7 +25,6 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -33,7 +32,7 @@ var truncatedID = regexp.MustCompile(`^([a-f0-9]{4,64})$`)
 
 // GetImage returns an image corresponding to the image referred to by refOrID.
 func (i *ImageService) GetImage(ctx context.Context, refOrID string, options imagetype.GetImageOpts) (*image.Image, error) {
-	desc, err := i.resolveDescriptor(ctx, refOrID)
+	desc, err := i.resolveImage(ctx, refOrID)
 	if err != nil {
 		return nil, err
 	}
@@ -44,20 +43,31 @@ func (i *ImageService) GetImage(ctx context.Context, refOrID string, options ima
 	}
 
 	cs := i.client.ContentStore()
-	conf, err := containerdimages.Config(ctx, cs, desc, platform)
+
+	var presentImages []ocispec.Image
+	err = i.walkImageManifests(ctx, desc, func(img *ImageManifest) error {
+		conf, err := img.Config(ctx)
+		if err != nil {
+			return err
+		}
+		var ociimage ocispec.Image
+		if err := readConfig(ctx, cs, conf, &ociimage); err != nil {
+			return err
+		}
+		presentImages = append(presentImages, ociimage)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	imageConfigBytes, err := content.ReadBlob(ctx, cs, conf)
-	if err != nil {
-		return nil, err
+	if len(presentImages) == 0 {
+		return nil, errdefs.NotFound(errors.New("failed to find image manifest"))
 	}
 
-	var ociimage ocispec.Image
-	if err := json.Unmarshal(imageConfigBytes, &ociimage); err != nil {
-		return nil, err
-	}
+	sort.SliceStable(presentImages, func(i, j int) bool {
+		return platform.Less(presentImages[i].Platform, presentImages[j].Platform)
+	})
+	ociimage := presentImages[0]
 
 	rootfs := image.NewRootFS()
 	for _, id := range ociimage.RootFS.DiffIDs {
@@ -68,11 +78,12 @@ func (i *ImageService) GetImage(ctx context.Context, refOrID string, options ima
 		exposedPorts[nat.Port(k)] = v
 	}
 
-	img := image.NewImage(image.ID(desc.Digest))
+	img := image.NewImage(image.ID(desc.Target.Digest))
 	img.V1Image = image.V1Image{
-		ID:           string(desc.Digest),
+		ID:           string(desc.Target.Digest),
 		OS:           ociimage.OS,
 		Architecture: ociimage.Architecture,
+		Created:      ociimage.Created,
 		Config: &containertypes.Config{
 			Entrypoint:   ociimage.Config.Entrypoint,
 			Env:          ociimage.Config.Env,
@@ -87,20 +98,21 @@ func (i *ImageService) GetImage(ctx context.Context, refOrID string, options ima
 	}
 
 	img.RootFS = rootfs
+	img.History = ociimage.History
 
 	if options.Details {
 		lastUpdated := time.Unix(0, 0)
-		size, err := i.size(ctx, desc, platform)
+		size, err := i.size(ctx, desc.Target, platform)
 		if err != nil {
 			return nil, err
 		}
 
-		tagged, err := i.client.ImageService().List(ctx, "target.digest=="+desc.Digest.String())
+		tagged, err := i.client.ImageService().List(ctx, "target.digest=="+desc.Target.Digest.String())
 		if err != nil {
 			return nil, err
 		}
 
-		// Each image will result in 2 references (named and digested).
+		// Usually each image will result in 2 references (named and digested).
 		refs := make([]reference.Named, 0, len(tagged)*2)
 		for _, i := range tagged {
 			if i.UpdatedAt.After(lastUpdated) {
@@ -111,7 +123,7 @@ func (i *ImageService) GetImage(ctx context.Context, refOrID string, options ima
 					// This is unexpected - dangling image should be deleted
 					// as soon as another image with the same target is created.
 					// Log a warning, but don't error out the whole operation.
-					logrus.WithField("refs", tagged).Warn("multiple images have the same target, but one of them is still dangling")
+					log.G(ctx).WithField("refs", tagged).Warn("multiple images have the same target, but one of them is still dangling")
 				}
 				continue
 			}
@@ -120,17 +132,22 @@ func (i *ImageService) GetImage(ctx context.Context, refOrID string, options ima
 			if err != nil {
 				// This is inconsistent with `docker image ls` which will
 				// still include the malformed name in RepoTags.
-				logrus.WithField("name", name).WithError(err).Error("failed to parse image name as reference")
+				log.G(ctx).WithField("name", name).WithError(err).Error("failed to parse image name as reference")
 				continue
 			}
 			refs = append(refs, name)
 
-			digested, err := reference.WithDigest(reference.TrimNamed(name), desc.Digest)
+			if _, ok := name.(reference.Digested); ok {
+				// Image name already contains a digest, so no need to create a digested reference.
+				continue
+			}
+
+			digested, err := reference.WithDigest(reference.TrimNamed(name), desc.Target.Digest)
 			if err != nil {
 				// This could only happen if digest is invalid, but considering that
 				// we get it from the Descriptor it's highly unlikely.
 				// Log error just in case.
-				logrus.WithError(err).Error("failed to create digested reference")
+				log.G(ctx).WithError(err).Error("failed to create digested reference")
 				continue
 			}
 			refs = append(refs, digested)
@@ -218,9 +235,18 @@ func (i *ImageService) size(ctx context.Context, desc ocispec.Descriptor, platfo
 // reference or identifier. Returns the descriptor of
 // the image, which could be a manifest list, manifest, or config.
 func (i *ImageService) resolveDescriptor(ctx context.Context, refOrID string) (ocispec.Descriptor, error) {
+	img, err := i.resolveImage(ctx, refOrID)
+	if err != nil {
+		return ocispec.Descriptor{}, err
+	}
+
+	return img.Target, nil
+}
+
+func (i *ImageService) resolveImage(ctx context.Context, refOrID string) (containerdimages.Image, error) {
 	parsed, err := reference.ParseAnyReference(refOrID)
 	if err != nil {
-		return ocispec.Descriptor{}, errdefs.InvalidParameter(err)
+		return containerdimages.Image{}, errdefs.InvalidParameter(err)
 	}
 
 	is := i.client.ImageService()
@@ -229,16 +255,43 @@ func (i *ImageService) resolveDescriptor(ctx context.Context, refOrID string) (o
 	if ok {
 		imgs, err := is.List(ctx, "target.digest=="+digested.Digest().String())
 		if err != nil {
-			return ocispec.Descriptor{}, errors.Wrap(err, "failed to lookup digest")
+			return containerdimages.Image{}, errors.Wrap(err, "failed to lookup digest")
 		}
 		if len(imgs) == 0 {
-			return ocispec.Descriptor{}, images.ErrImageDoesNotExist{Ref: parsed}
+			return containerdimages.Image{}, images.ErrImageDoesNotExist{Ref: parsed}
 		}
 
-		return imgs[0].Target, nil
+		// If reference is both Named and Digested, make sure we don't match
+		// images with a different repository even if digest matches.
+		// For example, busybox@sha256:abcdef..., shouldn't match asdf@sha256:abcdef...
+		if parsedNamed, ok := parsed.(reference.Named); ok {
+			for _, img := range imgs {
+				imgNamed, err := reference.ParseNormalizedNamed(img.Name)
+				if err != nil {
+					log.G(ctx).WithError(err).WithField("image", img.Name).Warn("image with invalid name encountered")
+					continue
+				}
+
+				if parsedNamed.Name() == imgNamed.Name() {
+					return img, nil
+				}
+			}
+			return containerdimages.Image{}, images.ErrImageDoesNotExist{Ref: parsed}
+		}
+
+		return imgs[0], nil
 	}
 
 	ref := reference.TagNameOnly(parsed.(reference.Named)).String()
+	img, err := is.Get(ctx, ref)
+	if err == nil {
+		return img, nil
+	} else {
+		// TODO(containerd): error translation can use common function
+		if !cerrdefs.IsNotFound(err) {
+			return containerdimages.Image{}, err
+		}
+	}
 
 	// If the identifier could be a short ID, attempt to match
 	if truncatedID.MatchString(refOrID) {
@@ -248,37 +301,28 @@ func (i *ImageService) resolveDescriptor(ctx context.Context, refOrID string) (o
 		}
 		imgs, err := is.List(ctx, filters...)
 		if err != nil {
-			return ocispec.Descriptor{}, err
+			return containerdimages.Image{}, err
 		}
 
 		if len(imgs) == 0 {
-			return ocispec.Descriptor{}, images.ErrImageDoesNotExist{Ref: parsed}
+			return containerdimages.Image{}, images.ErrImageDoesNotExist{Ref: parsed}
 		}
 		if len(imgs) > 1 {
 			digests := map[digest.Digest]struct{}{}
 			for _, img := range imgs {
 				if img.Name == ref {
-					return img.Target, nil
+					return img, nil
 				}
 				digests[img.Target.Digest] = struct{}{}
 			}
 
 			if len(digests) > 1 {
-				return ocispec.Descriptor{}, errdefs.NotFound(errors.New("ambiguous reference"))
+				return containerdimages.Image{}, errdefs.NotFound(errors.New("ambiguous reference"))
 			}
 		}
 
-		return imgs[0].Target, nil
+		return imgs[0], nil
 	}
 
-	img, err := is.Get(ctx, ref)
-	if err != nil {
-		// TODO(containerd): error translation can use common function
-		if !cerrdefs.IsNotFound(err) {
-			return ocispec.Descriptor{}, err
-		}
-		return ocispec.Descriptor{}, images.ErrImageDoesNotExist{Ref: parsed}
-	}
-
-	return img.Target, nil
+	return containerdimages.Image{}, images.ErrImageDoesNotExist{Ref: parsed}
 }

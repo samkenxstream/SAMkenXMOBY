@@ -17,7 +17,7 @@ const (
 	containerVethPrefix = "eth"
 	vethPrefix          = "veth"
 	vethLen             = len(vethPrefix) + 7
-	driverName          = "macvlan"      // driver type name
+	NetworkType         = "macvlan"      // driver type name
 	modePrivate         = "private"      // macvlan mode private
 	modeVepa            = "vepa"         // macvlan mode vepa
 	modeBridge          = "bridge"       // macvlan mode bridge
@@ -58,18 +58,16 @@ type network struct {
 
 // Register initializes and registers the libnetwork macvlan driver
 func Register(r driverapi.Registerer, config map[string]interface{}) error {
-	c := driverapi.Capability{
-		DataScope:         datastore.LocalScope,
-		ConnectivityScope: datastore.GlobalScope,
-	}
 	d := &driver{
 		networks: networkTable{},
 	}
 	if err := d.initStore(config); err != nil {
 		return err
 	}
-
-	return r.RegisterDriver(driverName, d, c)
+	return r.RegisterDriver(NetworkType, d, driverapi.Capability{
+		DataScope:         datastore.LocalScope,
+		ConnectivityScope: datastore.GlobalScope,
+	})
 }
 
 func (d *driver) NetworkAllocate(id string, option map[string]string, ipV4Data, ipV6Data []driverapi.IPAMData) (map[string]string, error) {
@@ -85,7 +83,7 @@ func (d *driver) EndpointOperInfo(nid, eid string) (map[string]interface{}, erro
 }
 
 func (d *driver) Type() string {
-	return driverName
+	return NetworkType
 }
 
 func (d *driver) IsBuiltIn() bool {

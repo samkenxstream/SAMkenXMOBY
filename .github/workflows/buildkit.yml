@@ -13,6 +13,8 @@ on:
   pull_request:
 
 env:
+  # FIXME(thaJeztah): update to newer go versions once BuildKit's vendoring has the fix from https://github.com/moby/moby/pull/45942
+  GO_VERSION: "1.20.5"
   DESTDIR: ./build
 
 jobs:
@@ -47,8 +49,6 @@ jobs:
   test:
     runs-on: ubuntu-20.04
     timeout-minutes: 120
-    env:
-      BUILDKIT_REPO: moby/buildkit
     needs:
       - build
     strategy:
@@ -82,7 +82,7 @@ jobs:
       -
         name: BuildKit ref
         run: |
-          echo "BUILDKIT_REF=$(./hack/buildkit-ref)" >> $GITHUB_ENV
+          echo "$(./hack/buildkit-ref)" >> $GITHUB_ENV
         working-directory: moby
       -
         name: Checkout BuildKit ${{ env.BUILDKIT_REF }}
@@ -106,7 +106,7 @@ jobs:
       -
         name: Update daemon.json
         run: |
-          sudo rm /etc/docker/daemon.json
+          sudo rm -f /etc/docker/daemon.json
           sudo service docker restart
           docker version
           docker info

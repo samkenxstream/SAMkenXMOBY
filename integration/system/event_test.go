@@ -29,7 +29,7 @@ import (
 
 func TestEventsExecDie(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.36"), "broken in earlier versions")
-	skip.If(t, testEnv.OSType == "windows", "FIXME. Suspect may need to wait until container is running before exec")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME. Suspect may need to wait until container is running before exec")
 	defer setupTest(t)()
 	ctx := context.Background()
 	client := testEnv.APIClient()
@@ -43,12 +43,11 @@ func TestEventsExecDie(t *testing.T) {
 	)
 	assert.NilError(t, err)
 
-	filters := filters.NewArgs(
-		filters.Arg("container", cID),
-		filters.Arg("event", "exec_die"),
-	)
-	msg, errors := client.Events(ctx, types.EventsOptions{
-		Filters: filters,
+	msg, errs := client.Events(ctx, types.EventsOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("container", cID),
+			filters.Arg("event", "exec_die"),
+		),
 	})
 
 	err = client.ContainerExecStart(ctx, id.ID,
@@ -66,7 +65,7 @@ func TestEventsExecDie(t *testing.T) {
 		assert.Equal(t, m.Action, "exec_die")
 		assert.Equal(t, m.Actor.Attributes["execID"], id.ID)
 		assert.Equal(t, m.Actor.Attributes["exitCode"], "0")
-	case err = <-errors:
+	case err = <-errs:
 		assert.NilError(t, err)
 	case <-time.After(time.Second * 3):
 		t.Fatal("timeout hit")
@@ -78,7 +77,7 @@ func TestEventsExecDie(t *testing.T) {
 // backward compatibility so old `JSONMessage` could still be used.
 // This test verifies that backward compatibility maintains.
 func TestEventsBackwardsCompatible(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows", "Windows doesn't support back-compat messages")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "Windows doesn't support back-compat messages")
 	defer setupTest(t)()
 	ctx := context.Background()
 	client := testEnv.APIClient()
@@ -129,7 +128,7 @@ func TestEventsBackwardsCompatible(t *testing.T) {
 // TestEventsVolumeCreate verifies that volume create events are only fired
 // once: when creating the volume, and not when attaching to a container.
 func TestEventsVolumeCreate(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows", "FIXME: Windows doesn't trigger the events? Could be a race")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME: Windows doesn't trigger the events? Could be a race")
 
 	defer setupTest(t)()
 	ctx, cancel := context.WithCancel(context.Background())

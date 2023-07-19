@@ -3,22 +3,29 @@ package containerd
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/plugin"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/snapshots"
+	"github.com/docker/distribution/reference"
+	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/container"
 	daemonevents "github.com/docker/docker/daemon/events"
 	"github.com/docker/docker/daemon/images"
+	"github.com/docker/docker/daemon/snapshotter"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
+	"github.com/docker/docker/registry"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 // ImageService implements daemon.ImageService
@@ -26,26 +33,26 @@ type ImageService struct {
 	client          *containerd.Client
 	containers      container.Store
 	snapshotter     string
-	registryHosts   RegistryHostsProvider
+	registryHosts   docker.RegistryHosts
 	registryService RegistryConfigProvider
 	eventsService   *daemonevents.Events
-}
-
-type RegistryHostsProvider interface {
-	RegistryHosts() docker.RegistryHosts
+	pruneRunning    atomic.Bool
+	refCountMounter snapshotter.Mounter
 }
 
 type RegistryConfigProvider interface {
 	IsInsecureRegistry(host string) bool
+	ResolveRepository(name reference.Named) (*registry.RepositoryInfo, error)
 }
 
 type ImageServiceConfig struct {
-	Client        *containerd.Client
-	Containers    container.Store
-	Snapshotter   string
-	HostsProvider RegistryHostsProvider
-	Registry      RegistryConfigProvider
-	EventsService *daemonevents.Events
+	Client          *containerd.Client
+	Containers      container.Store
+	Snapshotter     string
+	RegistryHosts   docker.RegistryHosts
+	Registry        RegistryConfigProvider
+	EventsService   *daemonevents.Events
+	RefCountMounter snapshotter.Mounter
 }
 
 // NewService creates a new ImageService.
@@ -54,9 +61,10 @@ func NewService(config ImageServiceConfig) *ImageService {
 		client:          config.Client,
 		containers:      config.Containers,
 		snapshotter:     config.Snapshotter,
-		registryHosts:   config.HostsProvider,
+		registryHosts:   config.RegistryHosts,
 		registryService: config.Registry,
 		eventsService:   config.EventsService,
+		refCountMounter: config.RefCountMounter,
 	}
 }
 
@@ -74,13 +82,6 @@ func (i *ImageService) CountImages() int {
 	}
 
 	return len(imgs)
-}
-
-// Children returns the children image.IDs for a parent image.
-// called from list.go to filter containers
-// TODO: refactor to expose an ancestry for image.ID?
-func (i *ImageService) Children(id image.ID) []image.ID {
-	panic("not implemented")
 }
 
 // CreateLayer creates a filesystem layer for a container.
@@ -159,9 +160,35 @@ func (i *ImageService) GetContainerLayerSize(ctx context.Context, containerID st
 	if ctr == nil {
 		return 0, 0, nil
 	}
+
+	snapshotter := i.client.SnapshotService(ctr.Driver)
+
+	usage, err := snapshotter.Usage(ctx, containerID)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	imageManifest, err := getContainerImageManifest(ctr)
+	if err != nil {
+		// Best efforts attempt to pick an image.
+		// We don't have platform information at this point, so we can only
+		// assume that the platform matches host.
+		// Otherwise this will give a wrong base image size (different
+		// platform), but should be close enough.
+		mfst, err := i.GetImageManifest(ctx, ctr.Config.Image, imagetypes.GetImageOpts{})
+		if err != nil {
+			// Log error, don't error out whole operation.
+			log.G(ctx).WithFields(logrus.Fields{
+				logrus.ErrorKey: err,
+				"container":     containerID,
+			}).Warn("empty ImageManifest, can't calculate base image size")
+			return usage.Size, 0, nil
+		}
+		imageManifest = *mfst
+	}
 	cs := i.client.ContentStore()
 
-	imageManifestBytes, err := content.ReadBlob(ctx, cs, *ctr.ImageManifest)
+	imageManifestBytes, err := content.ReadBlob(ctx, cs, imageManifest)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -180,12 +207,6 @@ func (i *ImageService) GetContainerLayerSize(ctx context.Context, containerID st
 		return 0, 0, err
 	}
 
-	snapshotter := i.client.SnapshotService(ctr.Driver)
-	usage, err := snapshotter.Usage(ctx, containerID)
-	if err != nil {
-		return 0, 0, err
-	}
-
 	sizeCache := make(map[digest.Digest]int64)
 	snapshotSizeFn := func(d digest.Digest) (int64, error) {
 		if s, ok := sizeCache[d]; ok {
@@ -200,10 +221,22 @@ func (i *ImageService) GetContainerLayerSize(ctx context.Context, containerID st
 	}
 
 	chainIDs := identity.ChainIDs(img.RootFS.DiffIDs)
-	virtualSize, err := computeVirtualSize(chainIDs, snapshotSizeFn)
+	snapShotSize, err := computeSnapshotSize(chainIDs, snapshotSizeFn)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	return usage.Size, usage.Size + virtualSize, nil
+	// TODO(thaJeztah): include content-store size for the image (similar to "GET /images/json")
+	return usage.Size, usage.Size + snapShotSize, nil
+}
+
+// getContainerImageManifest safely dereferences ImageManifest.
+// ImageManifest can be nil for containers created with Docker Desktop with old
+// containerd image store integration enabled which didn't set this field.
+func getContainerImageManifest(ctr *container.Container) (ocispec.Descriptor, error) {
+	if ctr.ImageManifest == nil {
+		return ocispec.Descriptor{}, errdefs.InvalidParameter(errors.New("container is missing ImageManifest (probably created on old version), please recreate it"))
+	}
+
+	return *ctr.ImageManifest, nil
 }

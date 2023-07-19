@@ -7,10 +7,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/errdefs"
-	"github.com/sirupsen/logrus"
 )
 
 // Service is a registry service. It tracks configuration data such as a list
@@ -35,28 +35,18 @@ func (s *Service) ServiceConfig() *registry.ServiceConfig {
 	return s.config.copy()
 }
 
-// LoadAllowNondistributableArtifacts loads allow-nondistributable-artifacts registries for Service.
-func (s *Service) LoadAllowNondistributableArtifacts(registries []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.config.loadAllowNondistributableArtifacts(registries)
-}
-
-// LoadMirrors loads registry mirrors for Service
-func (s *Service) LoadMirrors(mirrors []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.config.loadMirrors(mirrors)
-}
-
-// LoadInsecureRegistries loads insecure registries for Service
-func (s *Service) LoadInsecureRegistries(registries []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.config.loadInsecureRegistries(registries)
+// ReplaceConfig prepares a transaction which will atomically replace the
+// registry service's configuration when the returned commit function is called.
+func (s *Service) ReplaceConfig(options ServiceOptions) (commit func(), err error) {
+	config, err := newServiceConfig(options)
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.config = config
+	}, nil
 }
 
 // Auth contacts the public registry with the provided credentials,
@@ -64,7 +54,7 @@ func (s *Service) LoadInsecureRegistries(registries []string) error {
 // It can be used to verify the validity of a client's credentials.
 func (s *Service) Auth(ctx context.Context, authConfig *registry.AuthConfig, userAgent string) (status, token string, err error) {
 	// TODO Use ctx when searching for repositories
-	var registryHostName = IndexHostname
+	registryHostName := IndexHostname
 
 	if authConfig.ServerAddress != "" {
 		serverAddress := authConfig.ServerAddress
@@ -95,7 +85,7 @@ func (s *Service) Auth(ctx context.Context, authConfig *registry.AuthConfig, use
 			// Failed to authenticate; don't continue with (non-TLS) endpoints.
 			return status, token, err
 		}
-		logrus.WithError(err).Infof("Error logging in to endpoint, trying next endpoint")
+		log.G(ctx).WithError(err).Infof("Error logging in to endpoint, trying next endpoint")
 	}
 
 	return "", "", err

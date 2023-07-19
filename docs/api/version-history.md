@@ -13,6 +13,20 @@ keywords: "API, Docker, rcli, REST, documentation"
      will be rejected.
 -->
 
+## v1.44 API changes
+
+[Docker Engine API v1.44](https://docs.docker.com/engine/api/v1.44/) documentation
+
+* The `VirtualSize` field in the `GET /images/{name}/json`, `GET /images/json`,
+  and `GET /system/df` responses is now omitted. Use the `Size` field instead,
+  which contains the same information.
+* Read-only bind mounts are now made recursively read-only on kernel >= 5.12
+  with runtimes which support the feature.
+  `POST /containers/create`, `GET /containers/{id}/json`, and `GET /containers/json` now supports
+  `BindOptions.ReadOnlyNonRecursive` and `BindOptions.ReadOnlyForceRecursive` to customize the behavior.
+* `POST /containers/create` now accepts a `HealthConfig.StartInterval` to set the
+  interval for health checks during the start period.
+
 ## v1.43 API changes
 
 [Docker Engine API v1.43](https://docs.docker.com/engine/api/v1.43/) documentation
@@ -23,6 +37,12 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `GET /images/json` no longer includes hardcoded `<none>:<none>` and
   `<none>@<none>` in `RepoTags` and`RepoDigests` for untagged images.
   In such cases, empty arrays will be produced instead.
+* The `VirtualSize` field in the `GET /images/{name}/json`, `GET /images/json`,
+  and `GET /system/df` responses is deprecated and will no longer be included
+  in API v1.44. Use the `Size` field instead, which contains the same information.
+* `GET /info` now includes `no-new-privileges` in the `SecurityOptions` string
+  list when this option is enabled globally. This change is not versioned, and
+  affects all API versions if the daemon has this patch.
 
 ## v1.42 API changes
 
@@ -469,6 +489,7 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `POST /services/create` and `POST /services/(id or name)/update` now accept an optional `RollbackConfig` object which specifies rollback options.
 * `GET /services` now supports a `mode` filter to filter services based on the service mode (either `global` or `replicated`).
 * `POST /containers/(name)/update` now supports updating `NanoCpus` that represents CPU quota in units of 10<sup>-9</sup> CPUs.
+* `POST /plugins/{name}/disable` now accepts a `force` query-parameter to disable a plugin even if still in use.
 
 ## v1.27 API changes
 

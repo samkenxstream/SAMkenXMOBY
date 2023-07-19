@@ -120,24 +120,24 @@ func (s *DockerCLICommitSuite) TestCommitChange(c *testing.T) {
 	dockerCmd(c, "run", "--name", "test", "busybox", "true")
 
 	imageID, _ := dockerCmd(c, "commit",
-		"--change", "EXPOSE 8080",
-		"--change", "ENV DEBUG true",
-		"--change", "ENV test 1",
-		"--change", "ENV PATH /foo",
-		"--change", "LABEL foo bar",
-		"--change", "CMD [\"/bin/sh\"]",
-		"--change", "WORKDIR /opt",
-		"--change", "ENTRYPOINT [\"/bin/sh\"]",
-		"--change", "USER testuser",
-		"--change", "VOLUME /var/lib/docker",
-		"--change", "ONBUILD /usr/local/bin/python-build --dir /app/src",
+		"--change", `EXPOSE 8080`,
+		"--change", `ENV DEBUG true`,
+		"--change", `ENV test 1`,
+		"--change", `ENV PATH /foo`,
+		"--change", `LABEL foo bar`,
+		"--change", `CMD ["/bin/sh"]`,
+		"--change", `WORKDIR /opt`,
+		"--change", `ENTRYPOINT ["/bin/sh"]`,
+		"--change", `USER testuser`,
+		"--change", `VOLUME /var/lib/docker`,
+		"--change", `ONBUILD /usr/local/bin/python-build --dir /app/src`,
 		"test", "test-commit")
 	imageID = strings.TrimSpace(imageID)
 
 	expectedEnv := "[DEBUG=true test=1 PATH=/foo]"
 	// bug fixed in 1.36, add min APi >= 1.36 requirement
 	// PR record https://github.com/moby/moby/pull/35582
-	if versions.GreaterThan(testEnv.DaemonAPIVersion(), "1.35") && testEnv.OSType != "windows" {
+	if versions.GreaterThan(testEnv.DaemonAPIVersion(), "1.35") && testEnv.DaemonInfo.OSType != "windows" {
 		// The ordering here is due to `PATH` being overridden from the container's
 		// ENV.  On windows, the container doesn't have a `PATH` ENV variable so
 		// the ordering is the same as the cli.

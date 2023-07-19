@@ -1,9 +1,10 @@
 //go:build !windows
-// +build !windows
 
 package libnetwork
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -12,10 +13,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/libnetwork/etchosts"
 	"github.com/docker/docker/libnetwork/resolvconf"
 	"github.com/docker/docker/libnetwork/types"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -41,19 +42,19 @@ func (sb *Sandbox) startResolver(restore bool) {
 		if !restore {
 			err = sb.rebuildDNS()
 			if err != nil {
-				logrus.Errorf("Updating resolv.conf failed for container %s, %q", sb.ContainerID(), err)
+				log.G(context.TODO()).Errorf("Updating resolv.conf failed for container %s, %q", sb.ContainerID(), err)
 				return
 			}
 		}
 		sb.resolver.SetExtServers(sb.extDNS)
 
 		if err = sb.osSbox.InvokeFunc(sb.resolver.SetupFunc(0)); err != nil {
-			logrus.Errorf("Resolver Setup function failed for container %s, %q", sb.ContainerID(), err)
+			log.G(context.TODO()).Errorf("Resolver Setup function failed for container %s, %q", sb.ContainerID(), err)
 			return
 		}
 
 		if err = sb.resolver.Start(); err != nil {
-			logrus.Errorf("Resolver Start failed for container %s, %q", sb.ContainerID(), err)
+			log.G(context.TODO()).Errorf("Resolver Start failed for container %s, %q", sb.ContainerID(), err)
 		}
 	})
 }
@@ -130,13 +131,13 @@ func (sb *Sandbox) updateHostsFile(ifaceIPs []string) error {
 
 func (sb *Sandbox) addHostsEntries(recs []etchosts.Record) {
 	if err := etchosts.Add(sb.config.hostsPath, recs); err != nil {
-		logrus.Warnf("Failed adding service host entries to the running container: %v", err)
+		log.G(context.TODO()).Warnf("Failed adding service host entries to the running container: %v", err)
 	}
 }
 
 func (sb *Sandbox) deleteHostsEntries(recs []etchosts.Record) {
 	if err := etchosts.Delete(sb.config.hostsPath, recs); err != nil {
-		logrus.Warnf("Failed deleting service host entries to the running container: %v", err)
+		log.G(context.TODO()).Warnf("Failed deleting service host entries to the running container: %v", err)
 	}
 }
 
@@ -213,7 +214,7 @@ func (sb *Sandbox) setupDNS() error {
 			if !os.IsNotExist(err) {
 				return fmt.Errorf("could not copy source resolv.conf file %s to %s: %v", sb.config.originResolvConfPath, sb.config.resolvConfPath, err)
 			}
-			logrus.Infof("%s does not exist, we create an empty resolv.conf for container", sb.config.originResolvConfPath)
+			log.G(context.TODO()).Infof("%s does not exist, we create an empty resolv.conf for container", sb.config.originResolvConfPath)
 			if err := createFile(sb.config.resolvConfPath); err != nil {
 				return err
 			}
@@ -232,7 +233,7 @@ func (sb *Sandbox) setupDNS() error {
 			return err
 		}
 		// No /etc/resolv.conf found: we'll use the default resolvers (Google's Public DNS).
-		logrus.WithField("path", originResolvConfPath).Infof("no resolv.conf found, falling back to defaults")
+		log.G(context.TODO()).WithField("path", originResolvConfPath).Infof("no resolv.conf found, falling back to defaults")
 	}
 
 	var newRC *resolvconf.File
@@ -279,7 +280,8 @@ func (sb *Sandbox) setupDNS() error {
 	}
 
 	// Write hash
-	if err := os.WriteFile(sb.config.resolvConfHashFile, []byte(newRC.Hash), filePerm); err != nil {
+	err = os.WriteFile(sb.config.resolvConfHashFile, newRC.Hash, filePerm)
+	if err != nil {
 		return types.InternalErrorf("failed to write resolv.conf hash file when setting up dns for sandbox %s: %v", sb.ID(), err)
 	}
 
@@ -287,11 +289,6 @@ func (sb *Sandbox) setupDNS() error {
 }
 
 func (sb *Sandbox) updateDNS(ipv6Enabled bool) error {
-	var (
-		currHash string
-		hashFile = sb.config.resolvConfHashFile
-	)
-
 	// This is for the host mode networking
 	if sb.config.useDefaultSandBox {
 		return nil
@@ -301,26 +298,23 @@ func (sb *Sandbox) updateDNS(ipv6Enabled bool) error {
 		return nil
 	}
 
+	var currHash []byte
 	currRC, err := resolvconf.GetSpecific(sb.config.resolvConfPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
 	} else {
-		h, err := os.ReadFile(hashFile)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-		} else {
-			currHash = string(h)
+		currHash, err = os.ReadFile(sb.config.resolvConfHashFile)
+		if err != nil && !os.IsNotExist(err) {
+			return err
 		}
 	}
 
-	if currHash != "" && currHash != currRC.Hash {
+	if len(currHash) > 0 && !bytes.Equal(currHash, currRC.Hash) {
 		// Seems the user has changed the container resolv.conf since the last time
 		// we checked so return without doing anything.
-		// logrus.Infof("Skipping update of resolv.conf file with ipv6Enabled: %t because file was touched by user", ipv6Enabled)
+		// log.G(ctx).Infof("Skipping update of resolv.conf file with ipv6Enabled: %t because file was touched by user", ipv6Enabled)
 		return nil
 	}
 
@@ -344,14 +338,14 @@ func (sb *Sandbox) updateDNS(ipv6Enabled bool) error {
 		tmpHashFile.Close()
 		return err
 	}
-	_, err = tmpHashFile.Write([]byte(newRC.Hash))
+	_, err = tmpHashFile.Write(newRC.Hash)
 	if err1 := tmpHashFile.Close(); err == nil {
 		err = err1
 	}
 	if err != nil {
 		return err
 	}
-	return os.Rename(tmpHashFile.Name(), hashFile)
+	return os.Rename(tmpHashFile.Name(), sb.config.resolvConfHashFile)
 }
 
 // Embedded DNS server has to be enabled for this sandbox. Rebuild the container's

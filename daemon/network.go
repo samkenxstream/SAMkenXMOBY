@@ -9,12 +9,14 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/container"
 	clustertypes "github.com/docker/docker/daemon/cluster/provider"
+	"github.com/docker/docker/daemon/config"
 	internalnetwork "github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libnetwork"
@@ -160,7 +162,7 @@ func (daemon *Daemon) startIngressWorker() {
 			select {
 			case r := <-ingressJobsChannel:
 				if r.create != nil {
-					daemon.setupIngress(r.create, r.ip, ingressID)
+					daemon.setupIngress(&daemon.config().Config, r.create, r.ip, ingressID)
 					ingressID = r.create.ID
 				} else {
 					daemon.releaseIngress(ingressID)
@@ -199,7 +201,7 @@ func (daemon *Daemon) ReleaseIngress() (<-chan struct{}, error) {
 	return done, nil
 }
 
-func (daemon *Daemon) setupIngress(create *clustertypes.NetworkCreateRequest, ip net.IP, staleID string) {
+func (daemon *Daemon) setupIngress(cfg *config.Config, create *clustertypes.NetworkCreateRequest, ip net.IP, staleID string) {
 	controller := daemon.netController
 	controller.AgentInitWait()
 
@@ -207,11 +209,11 @@ func (daemon *Daemon) setupIngress(create *clustertypes.NetworkCreateRequest, ip
 		daemon.releaseIngress(staleID)
 	}
 
-	if _, err := daemon.createNetwork(create.NetworkCreateRequest, create.ID, true); err != nil {
+	if _, err := daemon.createNetwork(cfg, create.NetworkCreateRequest, create.ID, true); err != nil {
 		// If it is any other error other than already
 		// exists error log error and return.
 		if _, ok := err.(libnetwork.NetworkNameError); !ok {
-			logrus.Errorf("Failed creating ingress network: %v", err)
+			log.G(context.TODO()).Errorf("Failed creating ingress network: %v", err)
 			return
 		}
 		// Otherwise continue down the call to create or recreate sandbox.
@@ -219,7 +221,7 @@ func (daemon *Daemon) setupIngress(create *clustertypes.NetworkCreateRequest, ip
 
 	_, err := daemon.GetNetworkByID(create.ID)
 	if err != nil {
-		logrus.Errorf("Failed getting ingress network by id after creating: %v", err)
+		log.G(context.TODO()).Errorf("Failed getting ingress network by id after creating: %v", err)
 	}
 }
 
@@ -232,12 +234,12 @@ func (daemon *Daemon) releaseIngress(id string) {
 
 	n, err := controller.NetworkByID(id)
 	if err != nil {
-		logrus.Errorf("failed to retrieve ingress network %s: %v", id, err)
+		log.G(context.TODO()).Errorf("failed to retrieve ingress network %s: %v", id, err)
 		return
 	}
 
 	if err := n.Delete(libnetwork.NetworkDeleteOptionRemoveLB); err != nil {
-		logrus.Errorf("Failed to delete ingress network %s: %v", n.ID(), err)
+		log.G(context.TODO()).Errorf("Failed to delete ingress network %s: %v", n.ID(), err)
 		return
 	}
 }
@@ -277,18 +279,28 @@ func (daemon *Daemon) WaitForDetachment(ctx context.Context, networkName, networ
 
 // CreateManagedNetwork creates an agent network.
 func (daemon *Daemon) CreateManagedNetwork(create clustertypes.NetworkCreateRequest) error {
-	_, err := daemon.createNetwork(create.NetworkCreateRequest, create.ID, true)
+	_, err := daemon.createNetwork(&daemon.config().Config, create.NetworkCreateRequest, create.ID, true)
 	return err
 }
 
 // CreateNetwork creates a network with the given name, driver and other optional parameters
 func (daemon *Daemon) CreateNetwork(create types.NetworkCreateRequest) (*types.NetworkCreateResponse, error) {
-	return daemon.createNetwork(create, "", false)
+	return daemon.createNetwork(&daemon.config().Config, create, "", false)
 }
 
-func (daemon *Daemon) createNetwork(create types.NetworkCreateRequest, id string, agent bool) (*types.NetworkCreateResponse, error) {
+func (daemon *Daemon) createNetwork(cfg *config.Config, create types.NetworkCreateRequest, id string, agent bool) (*types.NetworkCreateResponse, error) {
 	if runconfig.IsPreDefinedNetwork(create.Name) {
 		return nil, PredefinedNetworkError(create.Name)
+	}
+
+	c := daemon.netController
+	driver := create.Driver
+	if driver == "" {
+		driver = c.Config().DefaultDriver
+	}
+
+	if driver == "overlay" && !daemon.cluster.IsManager() && !agent {
+		return nil, errdefs.Forbidden(errors.New(`This node is not a swarm manager. Use "docker swarm init" or "docker swarm join" to connect this node to swarm and try again.`))
 	}
 
 	var warning string
@@ -309,20 +321,14 @@ func (daemon *Daemon) createNetwork(create types.NetworkCreateRequest, id string
 		warning = fmt.Sprintf("Network with name %s (id : %s) already exists", nw.Name(), nw.ID())
 	}
 
-	c := daemon.netController
-	driver := create.Driver
-	if driver == "" {
-		driver = c.Config().DefaultDriver
-	}
-
 	networkOptions := make(map[string]string)
 	for k, v := range create.Options {
 		networkOptions[k] = v
 	}
-	if defaultOpts, ok := daemon.configStore.DefaultNetworkOpts[driver]; create.ConfigFrom == nil && ok {
+	if defaultOpts, ok := cfg.DefaultNetworkOpts[driver]; create.ConfigFrom == nil && ok {
 		for k, v := range defaultOpts {
 			if _, ok := networkOptions[k]; !ok {
-				logrus.WithFields(logrus.Fields{"driver": driver, "network": id, k: v}).Debug("Applying network default option")
+				log.G(context.TODO()).WithFields(logrus.Fields{"driver": driver, "network": id, k: v}).Debug("Applying network default option")
 				networkOptions[k] = v
 			}
 		}
@@ -373,10 +379,6 @@ func (daemon *Daemon) createNetwork(create types.NetworkCreateRequest, id string
 
 	n, err := c.NewNetwork(driver, create.Name, id, nwOptions...)
 	if err != nil {
-		if errors.Is(err, libnetwork.ErrDataStoreNotInitialized) {
-			//nolint: revive
-			return nil, errors.New("This node is not a swarm manager. Use \"docker swarm init\" or \"docker swarm join\" to connect this node to swarm and try again.")
-		}
 		return nil, err
 	}
 
@@ -410,7 +412,7 @@ func (daemon *Daemon) pluginRefCount(driver, capability string, mode int) {
 	if daemon.PluginStore != nil {
 		_, err := daemon.PluginStore.Get(driver, capability, mode)
 		if err != nil {
-			logrus.WithError(err).WithFields(logrus.Fields{"mode": mode, "driver": driver}).Error("Error handling plugin refcount operation")
+			log.G(context.TODO()).WithError(err).WithFields(logrus.Fields{"mode": mode, "driver": driver}).Error("Error handling plugin refcount operation")
 		}
 	}
 }
@@ -784,12 +786,12 @@ func (daemon *Daemon) clearAttachableNetworks() {
 			}
 			containerID := sb.ContainerID()
 			if err := daemon.DisconnectContainerFromNetwork(containerID, n.ID(), true); err != nil {
-				logrus.Warnf("Failed to disconnect container %s from swarm network %s on cluster leave: %v",
+				log.G(context.TODO()).Warnf("Failed to disconnect container %s from swarm network %s on cluster leave: %v",
 					containerID, n.Name(), err)
 			}
 		}
 		if err := daemon.DeleteManagedNetwork(n.ID()); err != nil {
-			logrus.Warnf("Failed to remove swarm network %s on cluster leave: %v", n.Name(), err)
+			log.G(context.TODO()).Warnf("Failed to remove swarm network %s on cluster leave: %v", n.Name(), err)
 		}
 	}
 }
@@ -1074,9 +1076,7 @@ func buildEndpointInfo(networkSettings *internalnetwork.Settings, n libnetwork.N
 }
 
 // buildJoinOptions builds endpoint Join options from a given network.
-func buildJoinOptions(networkSettings *internalnetwork.Settings, n interface {
-	Name() string
-}) ([]libnetwork.EndpointOption, error) {
+func buildJoinOptions(networkSettings *internalnetwork.Settings, n interface{ Name() string }) ([]libnetwork.EndpointOption, error) {
 	var joinOptions []libnetwork.EndpointOption
 	if epConfig, ok := networkSettings.Networks[n.Name()]; ok {
 		for _, str := range epConfig.Links {

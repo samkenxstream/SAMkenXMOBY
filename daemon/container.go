@@ -1,15 +1,18 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"time"
 
+	"github.com/containerd/containerd/log"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
@@ -22,7 +25,6 @@ import (
 	"github.com/moby/sys/signal"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // GetContainer looks for a container using the provided information, which could be
@@ -58,7 +60,7 @@ func (daemon *Daemon) GetContainer(prefixOrName string) (*container.Container, e
 		// or consistent w.r.t. the live daemon.containers Store so
 		// while reaching this code path may be indicative of a bug,
 		// it is not _necessarily_ the case.
-		logrus.WithField("prefixOrName", prefixOrName).
+		log.G(context.TODO()).WithField("prefixOrName", prefixOrName).
 			WithField("id", containerID).
 			Debugf("daemon.GetContainer: container is known to daemon.containersReplica but not daemon.containers")
 		return nil, containerNotFound(prefixOrName)
@@ -206,10 +208,10 @@ func (daemon *Daemon) generateHostname(id string, config *containertypes.Config)
 	}
 }
 
-func (daemon *Daemon) setSecurityOptions(container *container.Container, hostConfig *containertypes.HostConfig) error {
+func (daemon *Daemon) setSecurityOptions(cfg *config.Config, container *container.Container, hostConfig *containertypes.HostConfig) error {
 	container.Lock()
 	defer container.Unlock()
-	return daemon.parseSecurityOpt(container, hostConfig)
+	return daemon.parseSecurityOpt(cfg, &container.SecurityOptions, hostConfig)
 }
 
 func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *containertypes.HostConfig) error {
@@ -234,7 +236,7 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 
 // verifyContainerSettings performs validation of the hostconfig and config
 // structures.
-func (daemon *Daemon) verifyContainerSettings(hostConfig *containertypes.HostConfig, config *containertypes.Config, update bool) (warnings []string, err error) {
+func (daemon *Daemon) verifyContainerSettings(daemonCfg *configStore, hostConfig *containertypes.HostConfig, config *containertypes.Config, update bool) (warnings []string, err error) {
 	// First perform verification of settings common across all platforms.
 	if err = validateContainerConfig(config); err != nil {
 		return warnings, err
@@ -244,9 +246,9 @@ func (daemon *Daemon) verifyContainerSettings(hostConfig *containertypes.HostCon
 	}
 
 	// Now do platform-specific verification
-	warnings, err = verifyPlatformContainerSettings(daemon, hostConfig, update)
+	warnings, err = verifyPlatformContainerSettings(daemon, daemonCfg, hostConfig, update)
 	for _, w := range warnings {
-		logrus.Warn(w)
+		log.G(context.TODO()).Warn(w)
 	}
 	return warnings, err
 }

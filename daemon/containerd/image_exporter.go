@@ -9,6 +9,7 @@ import (
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/images/archive"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	cplatforms "github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution/reference"
@@ -18,6 +19,7 @@ import (
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -83,14 +85,14 @@ func (i *ImageService) ExportImage(ctx context.Context, names []string, outStrea
 			ref = reference.TagNameOnly(ref)
 			opts = append(opts, archive.WithManifest(target, ref.String()))
 
-			logrus.WithFields(logrus.Fields{
+			log.G(ctx).WithFields(logrus.Fields{
 				"target": target,
 				"name":   ref.String(),
 			}).Debug("export image")
 		} else {
 			opts = append(opts, archive.WithManifest(target))
 
-			logrus.WithFields(logrus.Fields{
+			log.G(ctx).WithFields(logrus.Fields{
 				"target": target,
 			}).Debug("export image without name")
 		}
@@ -103,41 +105,60 @@ func (i *ImageService) ExportImage(ctx context.Context, names []string, outStrea
 // complement of ExportImage.  The input stream is an uncompressed tar
 // ball containing images and metadata.
 func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, outStream io.Writer, quiet bool) error {
-	// TODO(vvoland): Allow user to pass platform
-	platform := cplatforms.All
-	imgs, err := i.client.Import(ctx, inTar, containerd.WithImportPlatform(platform))
+	opts := []containerd.ImportOpt{
+		// TODO(vvoland): Allow user to pass platform
+		containerd.WithImportPlatform(cplatforms.All),
 
+		// Create an additional image with dangling name for imported images...
+		containerd.WithDigestRef(danglingImageName),
+		/// ... but only if they don't have a name or it's invalid.
+		containerd.WithSkipDigestRef(func(nameFromArchive string) bool {
+			if nameFromArchive == "" {
+				return false
+			}
+			_, err := reference.ParseNormalizedNamed(nameFromArchive)
+			return err == nil
+		}),
+	}
+
+	imgs, err := i.client.Import(ctx, inTar, opts...)
 	if err != nil {
-		logrus.WithError(err).Debug("failed to import image to containerd")
+		log.G(ctx).WithError(err).Debug("failed to import image to containerd")
 		return errdefs.System(err)
 	}
 
-	store := i.client.ContentStore()
 	progress := streamformatter.NewStdoutWriter(outStream)
 
 	for _, img := range imgs {
-		allPlatforms, err := containerdimages.Platforms(ctx, store, img.Target)
-		if err != nil {
-			logrus.WithError(err).WithField("image", img.Name).Debug("failed to get image platforms")
-			return errdefs.Unknown(err)
-		}
-
 		name := img.Name
-		if named, err := reference.ParseNormalizedNamed(img.Name); err == nil {
-			name = reference.FamiliarName(named)
+		loadedMsg := "Loaded image"
+
+		if isDanglingImage(img) {
+			name = img.Target.Digest.String()
+			loadedMsg = "Loaded image ID"
+		} else if named, err := reference.ParseNormalizedNamed(img.Name); err == nil {
+			name = reference.FamiliarName(reference.TagNameOnly(named))
 		}
 
-		for _, platform := range allPlatforms {
-			logger := logrus.WithFields(logrus.Fields{
-				"platform": platform,
+		err = i.walkImageManifests(ctx, img, func(platformImg *ImageManifest) error {
+			logger := log.G(ctx).WithFields(logrus.Fields{
 				"image":    name,
+				"manifest": platformImg.Target().Digest,
 			})
-			platformImg := containerd.NewImageWithPlatform(i.client, img, cplatforms.OnlyStrict(platform))
+
+			if isPseudo, err := platformImg.IsPseudoImage(ctx); isPseudo || err != nil {
+				if err != nil {
+					logger.WithError(err).Warn("failed to read manifest")
+				} else {
+					logger.Debug("don't unpack non-image manifest")
+				}
+				return nil
+			}
 
 			unpacked, err := platformImg.IsUnpacked(ctx, i.snapshotter)
 			if err != nil {
-				logger.WithError(err).Debug("failed to check if image is unpacked")
-				continue
+				logger.WithError(err).Warn("failed to check if image is unpacked")
+				return nil
 			}
 
 			if !unpacked {
@@ -148,9 +169,13 @@ func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, outSt
 				}
 			}
 			logger.WithField("alreadyUnpacked", unpacked).WithError(err).Debug("unpack")
+			return nil
+		})
+		if err != nil {
+			return errors.Wrap(err, "failed to unpack loaded image")
 		}
 
-		fmt.Fprintf(progress, "Loaded image: %s\n", name)
+		fmt.Fprintf(progress, "%s: %s\n", loadedMsg, name)
 		i.LogImageEvent(img.Target.Digest.String(), img.Target.Digest.String(), "load")
 	}
 
@@ -189,16 +214,16 @@ func (i *ImageService) getBestDescriptorForExport(ctx context.Context, indexDesc
 			available, _, _, missing, err := containerdimages.Check(ctx, store, mfst, nil)
 			if err != nil {
 				hasMissingManifests = true
-				logrus.WithField("manifest", mfst.Digest).Warn("failed to check manifest's blob availability, won't export")
+				log.G(ctx).WithField("manifest", mfst.Digest).Warn("failed to check manifest's blob availability, won't export")
 				continue
 			}
 
 			if available && len(missing) == 0 {
 				presentManifests = append(presentManifests, mfst)
-				logrus.WithField("manifest", mfst.Digest).Debug("manifest content present, will export")
+				log.G(ctx).WithField("manifest", mfst.Digest).Debug("manifest content present, will export")
 			} else {
 				hasMissingManifests = true
-				logrus.WithFields(logrus.Fields{
+				log.G(ctx).WithFields(logrus.Fields{
 					"manifest": mfst.Digest,
 					"missing":  missing,
 				}).Debug("manifest is missing, won't export")

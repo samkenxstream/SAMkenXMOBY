@@ -110,7 +110,7 @@ func (s *DockerCLILinksSuite) TestLinksInspectLinksStarted(c *testing.T) {
 	err := json.Unmarshal([]byte(links), &result)
 	assert.NilError(c, err)
 
-	var expected = []string{
+	expected := []string{
 		"/container1:/testinspectlink/alias1",
 		"/container2:/testinspectlink/alias2",
 	}
@@ -130,7 +130,7 @@ func (s *DockerCLILinksSuite) TestLinksInspectLinksStopped(c *testing.T) {
 	err := json.Unmarshal([]byte(links), &result)
 	assert.NilError(c, err)
 
-	var expected = []string{
+	expected := []string{
 		"/container1:/testinspectlink/alias1",
 		"/container2:/testinspectlink/alias2",
 	}
@@ -218,7 +218,7 @@ func (s *DockerCLILinksSuite) TestLinkShortDefinition(c *testing.T) {
 	assert.Assert(c, waitRun(cid2) == nil)
 
 	links := inspectFieldJSON(c, cid2, "HostConfig.Links")
-	assert.Equal(c, links, "[\"/shortlinkdef:/link2/shortlinkdef\"]")
+	assert.Equal(c, links, `["/shortlinkdef:/link2/shortlinkdef"]`)
 }
 
 func (s *DockerCLILinksSuite) TestLinksNetworkHostContainer(c *testing.T) {

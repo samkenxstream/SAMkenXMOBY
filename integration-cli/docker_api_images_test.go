@@ -28,11 +28,9 @@ func (s *DockerAPISuite) TestAPIImagesFilter(c *testing.T) {
 		dockerCmd(c, "tag", "busybox", n)
 	}
 	getImages := func(filter string) []types.ImageSummary {
-		fltrs := filters.NewArgs()
-		fltrs.Add("reference", filter)
 		options := types.ImageListOptions{
 			All:     false,
-			Filters: fltrs,
+			Filters: filters.NewArgs(filters.Arg("reference", filter)),
 		}
 		images, err := apiClient.ImageList(context.Background(), options)
 		assert.NilError(c, err)
@@ -80,7 +78,7 @@ func (s *DockerAPISuite) TestAPIImagesDelete(c *testing.T) {
 	assert.NilError(c, err)
 	defer apiClient.Close()
 
-	if testEnv.OSType != "windows" {
+	if testEnv.DaemonInfo.OSType != "windows" {
 		testRequires(c, Network)
 	}
 	name := "test-api-images-delete"
@@ -104,7 +102,7 @@ func (s *DockerAPISuite) TestAPIImagesHistory(c *testing.T) {
 	assert.NilError(c, err)
 	defer apiClient.Close()
 
-	if testEnv.OSType != "windows" {
+	if testEnv.DaemonInfo.OSType != "windows" {
 		testRequires(c, Network)
 	}
 	name := "test-api-images-history"

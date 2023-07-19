@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/api/types/volume"
 	containerpkg "github.com/docker/docker/container"
 	clustertypes "github.com/docker/docker/daemon/cluster/provider"
@@ -27,7 +28,7 @@ import (
 	"github.com/docker/docker/plugin"
 	volumeopts "github.com/docker/docker/volume/service/opts"
 	"github.com/moby/swarmkit/v2/agent/exec"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Backend defines the executor component for a swarm agent.
@@ -52,7 +53,7 @@ type Backend interface {
 	SetContainerDependencyStore(name string, store exec.DependencyGetter) error
 	SetContainerSecretReferences(name string, refs []*swarm.SecretReference) error
 	SetContainerConfigReferences(name string, refs []*swarm.ConfigReference) error
-	SystemInfo() *types.Info
+	SystemInfo() *system.Info
 	Containers(ctx context.Context, config *types.ContainerListOptions) ([]*types.Container, error)
 	SetNetworkBootstrapKeys([]*networktypes.EncryptionKey) error
 	DaemonJoinsCluster(provider cluster.Provider)
@@ -75,7 +76,7 @@ type VolumeBackend interface {
 
 // ImageBackend is used by an executor to perform image operations
 type ImageBackend interface {
-	PullImage(ctx context.Context, image, tag string, platform *specs.Platform, metaHeaders map[string][]string, authConfig *registry.AuthConfig, outStream io.Writer) error
+	PullImage(ctx context.Context, image, tag string, platform *ocispec.Platform, metaHeaders map[string][]string, authConfig *registry.AuthConfig, outStream io.Writer) error
 	GetRepository(context.Context, reference.Named, *registry.AuthConfig) (distribution.Repository, error)
 	GetImage(ctx context.Context, refOrID string, options opts.GetImageOpts) (*image.Image, error)
 }

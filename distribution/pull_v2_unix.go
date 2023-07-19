@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package distribution // import "github.com/docker/docker/distribution"
 
@@ -7,11 +6,11 @@ import (
 	"context"
 	"sort"
 
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/manifestlist"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 func (ld *layerDescriptor) open(ctx context.Context) (distribution.ReadSeekCloser, error) {
@@ -19,7 +18,7 @@ func (ld *layerDescriptor) open(ctx context.Context) (distribution.ReadSeekClose
 	return blobs.Open(ctx, ld.digest)
 }
 
-func filterManifests(manifests []manifestlist.ManifestDescriptor, p specs.Platform) []manifestlist.ManifestDescriptor {
+func filterManifests(manifests []manifestlist.ManifestDescriptor, p ocispec.Platform) []manifestlist.ManifestDescriptor {
 	p = platforms.Normalize(withDefault(p))
 	m := platforms.Only(p)
 	var matches []manifestlist.ManifestDescriptor
@@ -28,7 +27,7 @@ func filterManifests(manifests []manifestlist.ManifestDescriptor, p specs.Platfo
 		if descP == nil || m.Match(*descP) {
 			matches = append(matches, desc)
 			if descP != nil {
-				logrus.Debugf("found match for %s with media type %s, digest %s", platforms.Format(p), desc.MediaType, desc.Digest.String())
+				log.G(context.TODO()).Debugf("found match for %s with media type %s, digest %s", platforms.Format(p), desc.MediaType, desc.Digest.String())
 			}
 		}
 	}
@@ -53,7 +52,7 @@ func checkImageCompatibility(imageOS, imageOSVersion string) error {
 	return nil
 }
 
-func withDefault(p specs.Platform) specs.Platform {
+func withDefault(p ocispec.Platform) ocispec.Platform {
 	def := maximumSpec()
 	if p.OS == "" {
 		p.OS = def.OS
@@ -65,7 +64,7 @@ func withDefault(p specs.Platform) specs.Platform {
 	return p
 }
 
-func formatPlatform(platform specs.Platform) string {
+func formatPlatform(platform ocispec.Platform) string {
 	if platform.OS == "" {
 		platform = platforms.DefaultSpec()
 	}

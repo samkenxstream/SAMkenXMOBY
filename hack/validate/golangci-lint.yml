@@ -5,6 +5,7 @@ linters:
     - gosec
     - gosimple
     - govet
+    - importas
     - ineffassign
     - misspell
     - revive
@@ -24,6 +25,18 @@ linters:
       - docs
 
 linters-settings:
+  importas:
+    # Do not allow unaliased imports of aliased packages.
+    no-unaliased: true
+
+    alias:
+      # Enforce alias to prevent it accidentally being used instead of our
+      # own errdefs package (or vice-versa).
+      - pkg: github.com/containerd/containerd/errdefs
+        alias: cerrdefs
+      - pkg: github.com/opencontainers/image-spec/specs-go/v1
+        alias: ocispec
+
   govet:
     check-shadowing: false
   depguard:

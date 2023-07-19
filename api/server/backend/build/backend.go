@@ -76,7 +76,7 @@ func (b *Backend) Build(ctx context.Context, config backend.BuildConfig) (string
 		return "", nil
 	}
 
-	var imageID = build.ImageID
+	imageID := build.ImageID
 	if options.Squash {
 		if imageID, err = squashBuild(build, b.imageComponent); err != nil {
 			return "", err
@@ -92,7 +92,7 @@ func (b *Backend) Build(ctx context.Context, config backend.BuildConfig) (string
 		stdout := config.ProgressWriter.StdoutFormatter
 		fmt.Fprintf(stdout, "Successfully built %s\n", stringid.TruncateID(imageID))
 	}
-	if imageID != "" {
+	if imageID != "" && !useBuildKit {
 		err = tagImages(ctx, b.imageComponent, config.ProgressWriter.StdoutFormatter, image.ID(imageID), tags)
 	}
 	return imageID, err

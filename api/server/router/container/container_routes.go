@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/docker/api/server/httpstatus"
 	"github.com/docker/docker/api/server/httputils"
@@ -21,9 +22,8 @@ import (
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/ioutils"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/net/websocket"
 )
 
@@ -44,7 +44,7 @@ func (s *containerRouter) postCommit(ctx context.Context, w http.ResponseWriter,
 	}
 
 	config, _, _, err := s.decoder.DecodeConfig(r.Body)
-	if err != nil && err != io.EOF { // Do not fail if body is empty.
+	if err != nil && !errors.Is(err, io.EOF) { // Do not fail if body is empty.
 		return err
 	}
 
@@ -53,16 +53,14 @@ func (s *containerRouter) postCommit(ctx context.Context, w http.ResponseWriter,
 		return errdefs.InvalidParameter(err)
 	}
 
-	commitCfg := &backend.CreateImageConfig{
+	imgID, err := s.backend.CreateImageFromContainer(ctx, r.Form.Get("container"), &backend.CreateImageConfig{
 		Pause:   pause,
 		Tag:     ref,
 		Author:  r.Form.Get("author"),
 		Comment: r.Form.Get("comment"),
 		Config:  config,
 		Changes: r.Form["changes"],
-	}
-
-	imgID, err := s.backend.CreateImageFromContainer(ctx, r.Form.Get("container"), commitCfg)
+	})
 	if err != nil {
 		return err
 	}
@@ -488,6 +486,9 @@ func (s *containerRouter) postContainersCreate(ctx context.Context, w http.Respo
 
 	config, hostConfig, networkingConfig, err := s.decoder.DecodeConfig(r.Body)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return errdefs.InvalidParameter(errors.New("invalid JSON: got EOF while reading request body"))
+		}
 		return err
 	}
 	version := httputils.VersionFromContext(ctx)
@@ -540,6 +541,14 @@ func (s *containerRouter) postContainersCreate(ctx context.Context, w http.Respo
 				bo.CreateMountpoint = false
 			}
 		}
+
+	}
+
+	if hostConfig != nil && versions.LessThan(version, "1.44") {
+		if config.Healthcheck != nil {
+			// StartInterval was added in API 1.44
+			config.Healthcheck.StartInterval = 0
+		}
 	}
 
 	if hostConfig != nil && versions.GreaterThanOrEqualTo(version, "1.42") {
@@ -568,7 +577,7 @@ func (s *containerRouter) postContainersCreate(ctx context.Context, w http.Respo
 		hostConfig.Annotations = nil
 	}
 
-	var platform *specs.Platform
+	var platform *ocispec.Platform
 	if versions.GreaterThanOrEqualTo(version, "1.41") {
 		if v := r.Form.Get("platform"); v != "" {
 			p, err := platforms.Parse(v)
@@ -585,6 +594,18 @@ func (s *containerRouter) postContainersCreate(ctx context.Context, w http.Respo
 		// Both `0` and `-1` are accepted as "unlimited", and historically any
 		// negative value was accepted, so treat those as "unlimited" as well.
 		hostConfig.PidsLimit = nil
+	}
+
+	if hostConfig != nil && versions.LessThan(version, "1.44") {
+		for _, m := range hostConfig.Mounts {
+			if m.BindOptions != nil {
+				// Ignore ReadOnlyNonRecursive because it was added in API 1.44.
+				m.BindOptions.ReadOnlyNonRecursive = false
+				if m.BindOptions.ReadOnlyForceRecursive {
+					return errdefs.InvalidParameter(errors.New("BindOptions.ReadOnlyForceRecursive needs API v1.44 or newer"))
+				}
+			}
+		}
 	}
 
 	ccr, err := s.backend.ContainerCreate(ctx, types.ContainerCreateConfig{
@@ -693,11 +714,11 @@ func (s *containerRouter) postContainersAttach(ctx context.Context, w http.Respo
 	}
 
 	if err = s.backend.ContainerAttach(containerName, attachConfig); err != nil {
-		logrus.WithError(err).Errorf("Handler for %s %s returned error", r.Method, r.URL.Path)
+		log.G(ctx).WithError(err).Errorf("Handler for %s %s returned error", r.Method, r.URL.Path)
 		// Remember to close stream if error happens
 		conn, _, errHijack := hijacker.Hijack()
 		if errHijack != nil {
-			logrus.WithError(err).Errorf("Handler for %s %s: unable to close stream; error when hijacking connection", r.Method, r.URL.Path)
+			log.G(ctx).WithError(err).Errorf("Handler for %s %s: unable to close stream; error when hijacking connection", r.Method, r.URL.Path)
 		} else {
 			statusCode := httpstatus.FromError(err)
 			statusText := http.StatusText(statusCode)
@@ -767,9 +788,9 @@ func (s *containerRouter) wsContainersAttach(ctx context.Context, w http.Respons
 	select {
 	case <-started:
 		if err != nil {
-			logrus.Errorf("Error attaching websocket: %s", err)
+			log.G(ctx).Errorf("Error attaching websocket: %s", err)
 		} else {
-			logrus.Debug("websocket connection was closed by client")
+			log.G(ctx).Debug("websocket connection was closed by client")
 		}
 		return nil
 	default:

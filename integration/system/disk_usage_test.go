@@ -13,7 +13,7 @@ import (
 )
 
 func TestDiskUsage(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows") // d.Start fails on Windows with `protocol not available`
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows") // d.Start fails on Windows with `protocol not available`
 
 	t.Parallel()
 
@@ -57,11 +57,10 @@ func TestDiskUsage(t *testing.T) {
 					LayersSize: du.LayersSize,
 					Images: []*types.ImageSummary{
 						{
-							Created:     du.Images[0].Created,
-							ID:          du.Images[0].ID,
-							RepoTags:    []string{"busybox:latest"},
-							Size:        du.LayersSize,
-							VirtualSize: du.LayersSize,
+							Created:  du.Images[0].Created,
+							ID:       du.Images[0].ID,
+							RepoTags: []string{"busybox:latest"},
+							Size:     du.LayersSize,
 						},
 					},
 					Containers: []*types.Container{},

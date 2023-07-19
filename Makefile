@@ -7,10 +7,6 @@ BUILDX ?= $(DOCKER) buildx
 DOCKER_GRAPHDRIVER := $(if $(DOCKER_GRAPHDRIVER),$(DOCKER_GRAPHDRIVER),$(shell docker info 2>&1 | grep "Storage Driver" | sed 's/.*: //'))
 export DOCKER_GRAPHDRIVER
 
-# get OS/Arch of docker engine
-DOCKER_OSARCH := $(shell bash -c 'source hack/make/.detect-daemon-osarch && echo $${DOCKER_ENGINE_OSARCH}')
-DOCKERFILE := $(shell bash -c 'source hack/make/.detect-daemon-osarch && echo $${DOCKERFILE}')
-
 DOCKER_GITCOMMIT := $(shell git rev-parse --short HEAD || echo unsupported)
 export DOCKER_GITCOMMIT
 
@@ -28,10 +24,9 @@ export VALIDATE_ORIGIN_BRANCH
 # option of "go build". For example, a built-in graphdriver priority list
 # can be changed during build time like this:
 #
-# make DOCKER_LDFLAGS="-X github.com/docker/docker/daemon/graphdriver.priority=overlay2,devicemapper" dynbinary
+# make DOCKER_LDFLAGS="-X github.com/docker/docker/daemon/graphdriver.priority=overlay2,zfs" dynbinary
 #
 DOCKER_ENVS := \
-	-e BUILD_APT_MIRROR \
 	-e BUILDFLAGS \
 	-e KEEPBUNDLE \
 	-e DOCKER_BUILD_ARGS \
@@ -41,6 +36,10 @@ DOCKER_ENVS := \
 	-e DOCKER_BUILDKIT \
 	-e DOCKER_BASH_COMPLETION_PATH \
 	-e DOCKER_CLI_PATH \
+	-e DOCKERCLI_VERSION \
+	-e DOCKERCLI_REPOSITORY \
+	-e DOCKERCLI_INTEGRATION_VERSION \
+	-e DOCKERCLI_INTEGRATION_REPOSITORY \
 	-e DOCKER_DEBUG \
 	-e DOCKER_EXPERIMENTAL \
 	-e DOCKER_GITCOMMIT \
@@ -107,8 +106,6 @@ DOCKER_PORT_FORWARD := $(if $(DOCKER_PORT),-p "$(DOCKER_PORT)",)
 DELVE_PORT_FORWARD := $(if $(DELVE_PORT),-p "$(DELVE_PORT)",)
 
 DOCKER_FLAGS := $(DOCKER) run --rm --privileged $(DOCKER_CONTAINER_NAME) $(DOCKER_ENVS) $(DOCKER_MOUNT) $(DOCKER_PORT_FORWARD) $(DELVE_PORT_FORWARD)
-BUILD_APT_MIRROR := $(if $(DOCKER_BUILD_APT_MIRROR),--build-arg APT_MIRROR=$(DOCKER_BUILD_APT_MIRROR))
-export BUILD_APT_MIRROR
 
 SWAGGER_DOCS_PORT ?= 9000
 
@@ -136,11 +133,16 @@ endif
 DOCKER_RUN_DOCKER := $(DOCKER_FLAGS) "$(DOCKER_IMAGE)"
 
 DOCKER_BUILD_ARGS += --build-arg=GO_VERSION
+DOCKER_BUILD_ARGS += --build-arg=APT_MIRROR
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_VERSION
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_REPOSITORY
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_INTEGRATION_VERSION
+DOCKER_BUILD_ARGS += --build-arg=DOCKERCLI_INTEGRATION_REPOSITORY
 ifdef DOCKER_SYSTEMD
 DOCKER_BUILD_ARGS += --build-arg=SYSTEMD=true
 endif
 
-BUILD_OPTS := ${BUILD_APT_MIRROR} ${DOCKER_BUILD_ARGS} ${DOCKER_BUILD_OPTS} -f "$(DOCKERFILE)"
+BUILD_OPTS := ${DOCKER_BUILD_ARGS} ${DOCKER_BUILD_OPTS}
 BUILD_CMD := $(BUILDX) build
 BAKE_CMD := $(BUILDX) bake
 
@@ -214,6 +216,11 @@ test-unit: build ## run the unit tests
 validate: build ## validate DCO, Seccomp profile generation, gofmt,\n./pkg/ isolation, golint, tests, tomls, go vet and vendor
 	$(DOCKER_RUN_DOCKER) hack/validate/all
 
+validate-generate-files:
+	$(BUILD_CMD) --target "validate" \
+		--output "type=cacheonly" \
+		--file "./hack/dockerfiles/generate-files.Dockerfile" .
+
 validate-%: build ## validate specific check
 	$(DOCKER_RUN_DOCKER) hack/validate/$*
 
@@ -235,3 +242,12 @@ swagger-docs: ## preview the API documentation
 		-e 'REDOC_OPTIONS=hide-hostname="true" lazy-rendering' \
 		-p $(SWAGGER_DOCS_PORT):80 \
 		bfirsh/redoc:1.14.0
+
+.PHONY: generate-files
+generate-files:
+	$(eval $@_TMP_OUT := $(shell mktemp -d -t moby-output.XXXXXXXXXX))
+	$(BUILD_CMD) --target "update" \
+		--output "type=local,dest=$($@_TMP_OUT)" \
+		--file "./hack/dockerfiles/generate-files.Dockerfile" .
+	cp -R "$($@_TMP_OUT)"/. .
+	rm -rf "$($@_TMP_OUT)"/*

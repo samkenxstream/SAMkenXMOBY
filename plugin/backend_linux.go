@@ -16,6 +16,7 @@ import (
 
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
@@ -35,9 +36,8 @@ import (
 	v2 "github.com/docker/docker/plugin/v2"
 	"github.com/moby/sys/mount"
 	"github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 var acceptedPluginFilterTags = map[string]bool{
@@ -165,19 +165,19 @@ func (pm *Manager) Privileges(ctx context.Context, ref reference.Named, metaHead
 		configSeen bool
 	)
 
-	h := func(ctx context.Context, desc specs.Descriptor) ([]specs.Descriptor, error) {
+	h := func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		switch desc.MediaType {
-		case schema2.MediaTypeManifest, specs.MediaTypeImageManifest:
+		case schema2.MediaTypeManifest, ocispec.MediaTypeImageManifest:
 			data, err := content.ReadBlob(ctx, pm.blobStore, desc)
 			if err != nil {
 				return nil, errors.Wrapf(err, "error reading image manifest from blob store for %s", ref)
 			}
 
-			var m specs.Manifest
+			var m ocispec.Manifest
 			if err := json.Unmarshal(data, &m); err != nil {
 				return nil, errors.Wrapf(err, "error unmarshaling image manifest for %s", ref)
 			}
-			return []specs.Descriptor{m.Config}, nil
+			return []ocispec.Descriptor{m.Config}, nil
 		case schema2.MediaTypePluginConfig:
 			configSeen = true
 			data, err := content.ReadBlob(ctx, pm.blobStore, desc)
@@ -383,8 +383,8 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 	out, waitProgress := setupProgressOutput(outStream, cancel)
 	defer waitProgress()
 
-	progressHandler := images.HandlerFunc(func(ctx context.Context, desc specs.Descriptor) ([]specs.Descriptor, error) {
-		logrus.WithField("mediaType", desc.MediaType).WithField("digest", desc.Digest.String()).Debug("Preparing to push plugin layer")
+	progressHandler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		log.G(ctx).WithField("mediaType", desc.MediaType).WithField("digest", desc.Digest.String()).Debug("Preparing to push plugin layer")
 		id := stringid.TruncateID(desc.Digest.String())
 		pj.add(remotes.MakeRefKey(ctx, desc), id)
 		progress.Update(out, id, "Preparing")
@@ -434,14 +434,14 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 		if resolver != nil {
 			pusher, _ := resolver.Pusher(ctx, ref.String())
 			if pusher != nil {
-				logrus.WithField("ref", ref).Debug("Re-attmpting push with http-fallback")
+				log.G(ctx).WithField("ref", ref).Debug("Re-attmpting push with http-fallback")
 				err2 := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, nil, func(h images.Handler) images.Handler {
 					return images.Handlers(progressHandler, h)
 				})
 				if err2 == nil {
 					err = nil
 				} else {
-					logrus.WithError(err2).WithField("ref", ref).Debug("Error while attempting push with http-fallback")
+					log.G(ctx).WithError(err2).WithField("ref", ref).Debug("Error while attempting push with http-fallback")
 				}
 			}
 		}
@@ -469,7 +469,7 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 // even though this is set on the descriptor
 // The OCI types do not have this field.
 type manifest struct {
-	specs.Manifest
+	ocispec.Manifest
 	MediaType string `json:"mediaType,omitempty"`
 }
 
@@ -482,7 +482,7 @@ func buildManifest(ctx context.Context, s content.Manager, config digest.Digest,
 	if err != nil {
 		return m, errors.Wrapf(err, "error reading plugin config content for digest %s", config)
 	}
-	m.Config = specs.Descriptor{
+	m.Config = ocispec.Descriptor{
 		MediaType: mediaTypePluginConfig,
 		Size:      configInfo.Size,
 		Digest:    configInfo.Digest,
@@ -493,7 +493,7 @@ func buildManifest(ctx context.Context, s content.Manager, config digest.Digest,
 		if err != nil {
 			return m, errors.Wrapf(err, "error fetching info for content digest %s", l)
 		}
-		m.Layers = append(m.Layers, specs.Descriptor{
+		m.Layers = append(m.Layers, ocispec.Descriptor{
 			MediaType: images.MediaTypeDockerSchema2LayerGzip, // TODO: This is assuming everything is a gzip compressed layer, but that may not be true.
 			Digest:    l,
 			Size:      info.Size,
@@ -504,12 +504,12 @@ func buildManifest(ctx context.Context, s content.Manager, config digest.Digest,
 
 // getManifestDescriptor gets the OCI descriptor for a manifest
 // It will generate a manifest if one does not exist
-func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (specs.Descriptor, error) {
-	logger := logrus.WithField("plugin", p.Name()).WithField("digest", p.Manifest)
+func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (ocispec.Descriptor, error) {
+	logger := log.G(ctx).WithField("plugin", p.Name()).WithField("digest", p.Manifest)
 	if p.Manifest != "" {
 		info, err := pm.blobStore.Info(ctx, p.Manifest)
 		if err == nil {
-			desc := specs.Descriptor{
+			desc := ocispec.Descriptor{
 				Size:      info.Size,
 				Digest:    info.Digest,
 				MediaType: images.MediaTypeDockerSchema2Manifest,
@@ -524,7 +524,7 @@ func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (spe
 
 	manifest, err := buildManifest(ctx, pm.blobStore, p.Config, p.Blobsums)
 	if err != nil {
-		return specs.Descriptor{}, err
+		return ocispec.Descriptor{}, err
 	}
 
 	desc, err := writeManifest(ctx, pm.blobStore, &manifest)
@@ -538,9 +538,9 @@ func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (spe
 	return desc, nil
 }
 
-func writeManifest(ctx context.Context, cs content.Store, m *manifest) (specs.Descriptor, error) {
+func writeManifest(ctx context.Context, cs content.Store, m *manifest) (ocispec.Descriptor, error) {
 	platform := platforms.DefaultSpec()
-	desc := specs.Descriptor{
+	desc := ocispec.Descriptor{
 		MediaType: images.MediaTypeDockerSchema2Manifest,
 		Platform:  &platform,
 	}
@@ -579,7 +579,7 @@ func (pm *Manager) Remove(name string, config *types.PluginRmConfig) error {
 
 	if p.IsEnabled() {
 		if err := pm.disable(p, c); err != nil {
-			logrus.Errorf("failed to disable plugin '%s': %s", p.Name(), err)
+			log.G(context.TODO()).Errorf("failed to disable plugin '%s': %s", p.Name(), err)
 		}
 	}
 

@@ -13,7 +13,8 @@ import (
 func (daemon *Daemon) ContainerUpdate(name string, hostConfig *container.HostConfig) (container.ContainerUpdateOKBody, error) {
 	var warnings []string
 
-	warnings, err := daemon.verifyContainerSettings(hostConfig, nil, true)
+	daemonCfg := daemon.config()
+	warnings, err := daemon.verifyContainerSettings(daemonCfg, hostConfig, nil, true)
 	if err != nil {
 		return container.ContainerUpdateOKBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
@@ -53,7 +54,7 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 
 	if ctr.RemovalInProgress || ctr.Dead {
 		ctr.Unlock()
-		return errCannotUpdate(ctr.ID, fmt.Errorf("container is marked for removal and cannot be \"update\""))
+		return errCannotUpdate(ctr.ID, fmt.Errorf(`container is marked for removal and cannot be "update"`))
 	}
 
 	if err := ctr.UpdateContainer(hostConfig); err != nil {

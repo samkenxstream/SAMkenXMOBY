@@ -19,9 +19,10 @@ import (
 	"github.com/containerd/containerd/archive"
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/content"
-	containerderrors "github.com/containerd/containerd/errdefs"
+	cerrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/images"
+	"github.com/containerd/containerd/log"
 	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/typeurl/v2"
 	"github.com/docker/docker/errdefs"
@@ -29,7 +30,7 @@ import (
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/hashicorp/go-multierror"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -60,6 +61,10 @@ type container struct {
 type task struct {
 	containerd.Task
 	ctr *container
+
+	// Workaround for https://github.com/containerd/containerd/issues/8557.
+	// See also https://github.com/moby/moby/issues/45595.
+	serializeExecStartsWorkaround sync.Mutex
 }
 
 type process struct {
@@ -71,7 +76,7 @@ func NewClient(ctx context.Context, cli *containerd.Client, stateDir, ns string,
 	c := &client{
 		client:   cli,
 		stateDir: stateDir,
-		logger:   logrus.WithField("module", "libcontainerd").WithField("namespace", ns),
+		logger:   log.G(ctx).WithField("module", "libcontainerd").WithField("namespace", ns),
 		ns:       ns,
 		backend:  b,
 	}
@@ -127,7 +132,7 @@ func (c *client) NewContainer(ctx context.Context, id string, ociSpec *specs.Spe
 
 	ctr, err := c.client.NewContainer(ctx, id, opts...)
 	if err != nil {
-		if containerderrors.IsAlreadyExists(err) {
+		if cerrdefs.IsAlreadyExists(err) {
 			return nil, errors.WithStack(errdefs.Conflict(errors.New("id already in use")))
 		}
 		return nil, wrapError(err)
@@ -285,7 +290,7 @@ func (t *task) Exec(ctx context.Context, processID string, spec *specs.Process, 
 	})
 	if err != nil {
 		close(stdinCloseSync)
-		if containerderrors.IsAlreadyExists(err) {
+		if cerrdefs.IsAlreadyExists(err) {
 			return nil, errors.WithStack(errdefs.Conflict(errors.New("id already in use")))
 		}
 		return nil, wrapError(err)
@@ -296,7 +301,12 @@ func (t *task) Exec(ctx context.Context, processID string, spec *specs.Process, 
 	// the stdin of exec process will be created after p.Start in containerd
 	defer func() { stdinCloseSync <- p }()
 
-	if err = p.Start(ctx); err != nil {
+	err = func() error {
+		t.serializeExecStartsWorkaround.Lock()
+		defer t.serializeExecStartsWorkaround.Unlock()
+		return p.Start(ctx)
+	}()
+	if err != nil {
 		// use new context for cleanup because old one may be cancelled by user, but leave a timeout to make sure
 		// we are not waiting forever if containerd is unresponsive or to work around fifo cancelling issues in
 		// older containerd-shim
@@ -439,12 +449,12 @@ func (t *task) CreateCheckpoint(ctx context.Context, checkpointDir string, exit 
 	if err != nil {
 		return errdefs.System(errors.Wrapf(err, "failed to retrieve checkpoint data"))
 	}
-	var index v1.Index
+	var index ocispec.Index
 	if err := json.Unmarshal(b, &index); err != nil {
 		return errdefs.System(errors.Wrapf(err, "failed to decode checkpoint data"))
 	}
 
-	var cpDesc *v1.Descriptor
+	var cpDesc *ocispec.Descriptor
 	for _, m := range index.Manifests {
 		m := m
 		if m.MediaType == images.MediaTypeContainerd1Checkpoint {
@@ -473,7 +483,7 @@ func (t *task) CreateCheckpoint(ctx context.Context, checkpointDir string, exit 
 func (c *client) LoadContainer(ctx context.Context, id string) (libcontainerdtypes.Container, error) {
 	ctr, err := c.client.LoadContainer(ctx, id)
 	if err != nil {
-		if containerderrors.IsNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil, errors.WithStack(errdefs.NotFound(errors.New("no such container")))
 		}
 		return nil, wrapError(err)
@@ -588,7 +598,7 @@ func (c *client) waitServe(ctx context.Context) bool {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				return false
 			}
-			logrus.WithError(err).Warn("Error while testing if containerd API is ready")
+			log.G(ctx).WithError(err).Warn("Error while testing if containerd API is ready")
 		}
 
 		if serving {
@@ -711,13 +721,15 @@ func (c *client) processEventStream(ctx context.Context, ns string) {
 				c.logger.WithFields(logrus.Fields{
 					"topic":     ev.Topic,
 					"type":      reflect.TypeOf(t),
-					"container": t.ContainerID},
+					"container": t.ContainerID,
+				},
 				).Info("ignoring event")
 				continue
 			default:
 				c.logger.WithFields(logrus.Fields{
 					"topic": ev.Topic,
-					"type":  reflect.TypeOf(t)},
+					"type":  reflect.TypeOf(t),
+				},
 				).Info("ignoring event")
 				continue
 			}
@@ -758,7 +770,7 @@ func wrapError(err error) error {
 	switch {
 	case err == nil:
 		return nil
-	case containerderrors.IsNotFound(err):
+	case cerrdefs.IsNotFound(err):
 		return errdefs.NotFound(err)
 	}
 

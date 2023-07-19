@@ -6,9 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/containerd/containerd/content"
@@ -16,17 +16,15 @@ import (
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/leases"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/rootfs"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/docker/docker/api/types/backend"
-	containerapi "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
 )
 
 /*
@@ -40,7 +38,12 @@ func (i *ImageService) CommitImage(ctx context.Context, cc backend.CommitConfig)
 	container := i.containers.Get(cc.ContainerID)
 	cs := i.client.ContentStore()
 
-	imageManifestBytes, err := content.ReadBlob(ctx, cs, *container.ImageManifest)
+	imageManifest, err := getContainerImageManifest(container)
+	if err != nil {
+		return "", err
+	}
+
+	imageManifestBytes, err := content.ReadBlob(ctx, cs, imageManifest)
 	if err != nil {
 		return "", err
 	}
@@ -76,10 +79,7 @@ func (i *ImageService) CommitImage(ctx context.Context, cc backend.CommitConfig)
 		return "", fmt.Errorf("failed to export layer: %w", err)
 	}
 
-	imageConfig, err := generateCommitImageConfig(ctx, container.Config, ociimage, diffID, cc)
-	if err != nil {
-		return "", fmt.Errorf("failed to generate commit image config: %w", err)
-	}
+	imageConfig := generateCommitImageConfig(ociimage, diffID, cc)
 
 	rootfsID := identity.ChainID(imageConfig.RootFS.DiffIDs).String()
 	if err := applyDiffLayer(ctx, rootfsID, ociimage, sn, differ, diffLayerDesc); err != nil {
@@ -111,14 +111,9 @@ func (i *ImageService) CommitImage(ctx context.Context, cc backend.CommitConfig)
 	return image.ID(img.Target.Digest), nil
 }
 
-// generateCommitImageConfig returns commit oci image config based on the container's image.
-func generateCommitImageConfig(ctx context.Context, container *containerapi.Config, baseConfig ocispec.Image, diffID digest.Digest, opts backend.CommitConfig) (ocispec.Image, error) {
-	if opts.Config.Cmd != nil {
-		baseConfig.Config.Cmd = opts.Config.Cmd
-	}
-	if opts.Config.Entrypoint != nil {
-		baseConfig.Config.Entrypoint = opts.Config.Entrypoint
-	}
+// generateCommitImageConfig generates an OCI Image config based on the
+// container's image and the CommitConfig options.
+func generateCommitImageConfig(baseConfig ocispec.Image, diffID digest.Digest, opts backend.CommitConfig) ocispec.Image {
 	if opts.Author == "" {
 		opts.Author = baseConfig.Author
 	}
@@ -127,32 +122,35 @@ func generateCommitImageConfig(ctx context.Context, container *containerapi.Conf
 	arch := baseConfig.Architecture
 	if arch == "" {
 		arch = runtime.GOARCH
-		logrus.Warnf("assuming arch=%q", arch)
+		log.G(context.TODO()).Warnf("assuming arch=%q", arch)
 	}
 	os := baseConfig.OS
 	if os == "" {
 		os = runtime.GOOS
-		logrus.Warnf("assuming os=%q", os)
+		log.G(context.TODO()).Warnf("assuming os=%q", os)
 	}
-	logrus.Debugf("generateCommitImageConfig(): arch=%q, os=%q", arch, os)
+	log.G(context.TODO()).Debugf("generateCommitImageConfig(): arch=%q, os=%q", arch, os)
 	return ocispec.Image{
-		Architecture: arch,
-		OS:           os,
-		Created:      &createdTime,
-		Author:       opts.Author,
-		Config:       baseConfig.Config,
+		Platform: ocispec.Platform{
+			Architecture: arch,
+			OS:           os,
+		},
+		Created: &createdTime,
+		Author:  opts.Author,
+		Config:  containerConfigToOciImageConfig(opts.Config),
 		RootFS: ocispec.RootFS{
 			Type:    "layers",
 			DiffIDs: append(baseConfig.RootFS.DiffIDs, diffID),
 		},
 		History: append(baseConfig.History, ocispec.History{
-			Created:    &createdTime,
-			CreatedBy:  "", // FIXME(ndeloof) ?
-			Author:     opts.Author,
-			Comment:    opts.Comment,
+			Created:   &createdTime,
+			CreatedBy: strings.Join(opts.ContainerConfig.Cmd, " "),
+			Author:    opts.Author,
+			Comment:   opts.Comment,
+			// TODO(laurazard): this check might be incorrect
 			EmptyLayer: diffID == "",
 		}),
-	}, nil
+	}
 }
 
 // writeContentsForImage will commit oci image config and manifest into containerd's content store.
@@ -264,7 +262,7 @@ func applyDiffLayer(ctx context.Context, name string, baseImg ocispec.Image, sn 
 			// NOTE: the snapshotter should be hold by lease. Even
 			// if the cleanup fails, the containerd gc can delete it.
 			if err := sn.Remove(ctx, key); err != nil {
-				logrus.Warnf("failed to cleanup aborted apply %s: %s", key, err)
+				log.G(ctx).Warnf("failed to cleanup aborted apply %s: %s", key, err)
 			}
 		}
 	}()
@@ -301,5 +299,13 @@ func uniquePart() string {
 //
 // This is a temporary shim. Should be removed when builder stops using commit.
 func (i *ImageService) CommitBuildStep(ctx context.Context, c backend.CommitConfig) (image.ID, error) {
-	return "", errdefs.NotImplemented(errors.New("not implemented"))
+	ctr := i.containers.Get(c.ContainerID)
+	if ctr == nil {
+		// TODO: use typed error
+		return "", fmt.Errorf("container not found: %s", c.ContainerID)
+	}
+	c.ContainerMountLabel = ctr.MountLabel
+	c.ContainerOS = ctr.OS
+	c.ParentImageID = string(ctr.ImageID)
+	return i.CommitImage(ctx, c)
 }

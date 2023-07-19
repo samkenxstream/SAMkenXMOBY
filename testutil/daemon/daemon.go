@@ -13,11 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/container"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/stringid"
+	"github.com/docker/docker/pkg/tailfile"
 	"github.com/docker/docker/testutil/request"
 	"github.com/docker/go-connections/sockets"
 	"github.com/docker/go-connections/tlsconfig"
@@ -89,7 +91,7 @@ type Daemon struct {
 	DataPathPort    uint32
 	OOMScoreAdjust  int
 	// cached information
-	CachedInfo types.Info
+	CachedInfo system.Info
 }
 
 // NewDaemon returns a Daemon instance to be used for testing.
@@ -98,7 +100,7 @@ type Daemon struct {
 func NewDaemon(workingDir string, ops ...Option) (*Daemon, error) {
 	storageDriver := os.Getenv("DOCKER_GRAPHDRIVER")
 
-	if err := os.MkdirAll(SockRoot, 0700); err != nil {
+	if err := os.MkdirAll(SockRoot, 0o700); err != nil {
 		return nil, errors.Wrapf(err, "failed to create daemon socket root %q", SockRoot)
 	}
 
@@ -109,7 +111,7 @@ func NewDaemon(workingDir string, ops ...Option) (*Daemon, error) {
 		return nil, err
 	}
 	daemonRoot := filepath.Join(daemonFolder, "root")
-	if err := os.MkdirAll(daemonRoot, 0755); err != nil {
+	if err := os.MkdirAll(daemonRoot, 0o755); err != nil {
 		return nil, errors.Wrapf(err, "failed to create daemon root %q", daemonRoot)
 	}
 
@@ -139,7 +141,7 @@ func NewDaemon(workingDir string, ops ...Option) (*Daemon, error) {
 	}
 
 	if d.rootlessUser != nil {
-		if err := os.Chmod(SockRoot, 0777); err != nil {
+		if err := os.Chmod(SockRoot, 0o777); err != nil {
 			return nil, err
 		}
 		uid, err := strconv.Atoi(d.rootlessUser.Uid)
@@ -156,20 +158,20 @@ func NewDaemon(workingDir string, ops ...Option) (*Daemon, error) {
 		if err := os.Chown(d.Root, uid, gid); err != nil {
 			return nil, err
 		}
-		if err := os.MkdirAll(filepath.Dir(d.execRoot), 0700); err != nil {
+		if err := os.MkdirAll(filepath.Dir(d.execRoot), 0o700); err != nil {
 			return nil, err
 		}
 		if err := os.Chown(filepath.Dir(d.execRoot), uid, gid); err != nil {
 			return nil, err
 		}
-		if err := os.MkdirAll(d.execRoot, 0700); err != nil {
+		if err := os.MkdirAll(d.execRoot, 0o700); err != nil {
 			return nil, err
 		}
 		if err := os.Chown(d.execRoot, uid, gid); err != nil {
 			return nil, err
 		}
 		d.rootlessXDGRuntimeDir = filepath.Join(d.Folder, "xdgrun")
-		if err := os.MkdirAll(d.rootlessXDGRuntimeDir, 0700); err != nil {
+		if err := os.MkdirAll(d.rootlessXDGRuntimeDir, 0o700); err != nil {
 			return nil, err
 		}
 		if err := os.Chown(d.rootlessXDGRuntimeDir, uid, gid); err != nil {
@@ -295,10 +297,41 @@ func (d *Daemon) Cleanup(t testing.TB) {
 	cleanupNetworkNamespace(t, d)
 }
 
+// TailLogsT attempts to tail N lines from the daemon logs.
+// If there is an error the error is only logged, it does not cause an error with the test.
+func (d *Daemon) TailLogsT(t LogT, n int) {
+	lines, err := d.TailLogs(n)
+	if err != nil {
+		t.Logf("[%s] %v", d.id, err)
+		return
+	}
+	for _, l := range lines {
+		t.Logf("[%s] %s", d.id, string(l))
+	}
+}
+
+// TailLogs tails N lines from the daemon logs
+func (d *Daemon) TailLogs(n int) ([][]byte, error) {
+	logF, err := os.Open(d.logFile.Name())
+	if err != nil {
+		return nil, errors.Wrap(err, "error opening daemon log file after failed start")
+	}
+
+	defer logF.Close()
+	lines, err := tailfile.TailFile(logF, n)
+	if err != nil {
+		return nil, errors.Wrap(err, "error tailing log daemon logs")
+	}
+
+	return lines, nil
+
+}
+
 // Start starts the daemon and return once it is ready to receive requests.
 func (d *Daemon) Start(t testing.TB, args ...string) {
 	t.Helper()
 	if err := d.StartWithError(args...); err != nil {
+		d.TailLogsT(t, 20)
 		d.DumpStackAndQuit() // in case the daemon is stuck
 		t.Fatalf("[%s] failed to start daemon with arguments %v : %v", d.id, d.args, err)
 	}
@@ -307,7 +340,7 @@ func (d *Daemon) Start(t testing.TB, args ...string) {
 // StartWithError starts the daemon and return once it is ready to receive requests.
 // It returns an error in case it couldn't start.
 func (d *Daemon) StartWithError(args ...string) error {
-	logFile, err := os.OpenFile(filepath.Join(d.Folder, "docker.log"), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
+	logFile, err := os.OpenFile(filepath.Join(d.Folder, "docker.log"), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return errors.Wrapf(err, "[%s] failed to create logfile", d.id)
 	}
@@ -816,13 +849,30 @@ func (d *Daemon) queryRootDir() (string, error) {
 }
 
 // Info returns the info struct for this daemon
-func (d *Daemon) Info(t testing.TB) types.Info {
+func (d *Daemon) Info(t testing.TB) system.Info {
 	t.Helper()
 	c := d.NewClientT(t)
 	info, err := c.Info(context.Background())
 	assert.NilError(t, err)
 	assert.NilError(t, c.Close())
 	return info
+}
+
+// TamperWithContainerConfig modifies the on-disk config of a container.
+func (d *Daemon) TamperWithContainerConfig(t testing.TB, containerID string, tamper func(*container.Container)) {
+	t.Helper()
+
+	configPath := filepath.Join(d.Root, "containers", containerID, "config.v2.json")
+	configBytes, err := os.ReadFile(configPath)
+	assert.NilError(t, err)
+
+	var c container.Container
+	assert.NilError(t, json.Unmarshal(configBytes, &c))
+	c.State = container.NewState()
+	tamper(&c)
+	configBytes, err = json.Marshal(&c)
+	assert.NilError(t, err)
+	assert.NilError(t, os.WriteFile(configPath, configBytes, 0600))
 }
 
 // cleanupRaftDir removes swarmkit wal files if present

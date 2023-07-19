@@ -27,12 +27,6 @@ func (s *DockerCLIInspectSuite) OnTimeout(c *testing.T) {
 	s.ds.OnTimeout(c)
 }
 
-func checkValidGraphDriver(c *testing.T, name string) {
-	if name != "devicemapper" && name != "overlay" && name != "vfs" && name != "zfs" && name != "btrfs" && name != "aufs" {
-		c.Fatalf("%v is not a valid graph driver name", name)
-	}
-}
-
 func (s *DockerCLIInspectSuite) TestInspectImage(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	imageTest := "emptyfs"
@@ -78,7 +72,7 @@ func (s *DockerCLIInspectSuite) TestInspectStatus(c *testing.T) {
 
 	// Windows does not support pause/unpause on Windows Server Containers.
 	// (RS1 does for Hyper-V Containers, but production CI is not setup for that)
-	if testEnv.OSType != "windows" {
+	if testEnv.DaemonInfo.OSType != "windows" {
 		dockerCmd(c, "pause", out)
 		inspectOut = inspectField(c, out, "State.Status")
 		assert.Equal(c, inspectOut, "paused")
@@ -177,53 +171,10 @@ func (s *DockerCLIInspectSuite) TestInspectContainerFilterInt(c *testing.T) {
 	assert.Equal(c, inspectResult, true)
 }
 
-func (s *DockerCLIInspectSuite) TestInspectImageGraphDriver(c *testing.T) {
-	testRequires(c, DaemonIsLinux, Devicemapper)
-	imageTest := "emptyfs"
-	name := inspectField(c, imageTest, "GraphDriver.Name")
-
-	checkValidGraphDriver(c, name)
-
-	deviceID := inspectField(c, imageTest, "GraphDriver.Data.DeviceId")
-
-	_, err := strconv.Atoi(deviceID)
-	assert.Assert(c, err == nil, "failed to inspect DeviceId of the image: %s, %v", deviceID, err)
-
-	deviceSize := inspectField(c, imageTest, "GraphDriver.Data.DeviceSize")
-
-	_, err = strconv.ParseUint(deviceSize, 10, 64)
-	assert.Assert(c, err == nil, "failed to inspect DeviceSize of the image: %s, %v", deviceSize, err)
-}
-
-func (s *DockerCLIInspectSuite) TestInspectContainerGraphDriver(c *testing.T) {
-	testRequires(c, DaemonIsLinux, Devicemapper)
-
-	out, _ := dockerCmd(c, "run", "-d", "busybox", "true")
-	out = strings.TrimSpace(out)
-
-	name := inspectField(c, out, "GraphDriver.Name")
-
-	checkValidGraphDriver(c, name)
-
-	imageDeviceID := inspectField(c, "busybox", "GraphDriver.Data.DeviceId")
-
-	deviceID := inspectField(c, out, "GraphDriver.Data.DeviceId")
-
-	assert.Assert(c, imageDeviceID != deviceID)
-
-	_, err := strconv.Atoi(deviceID)
-	assert.Assert(c, err == nil, "failed to inspect DeviceId of the image: %s, %v", deviceID, err)
-
-	deviceSize := inspectField(c, out, "GraphDriver.Data.DeviceSize")
-
-	_, err = strconv.ParseUint(deviceSize, 10, 64)
-	assert.Assert(c, err == nil, "failed to inspect DeviceSize of the image: %s, %v", deviceSize, err)
-}
-
 func (s *DockerCLIInspectSuite) TestInspectBindMountPoint(c *testing.T) {
 	modifier := ",z"
 	prefix, slash := getPrefixAndSlashFromDaemonPlatform()
-	if testEnv.OSType == "windows" {
+	if testEnv.DaemonInfo.OSType == "windows" {
 		modifier = ""
 		// Linux creates the host directory if it doesn't exist. Windows does not.
 		os.Mkdir(`c:\data`, os.ModeDir)
@@ -246,7 +197,7 @@ func (s *DockerCLIInspectSuite) TestInspectBindMountPoint(c *testing.T) {
 	assert.Equal(c, m.Driver, "")
 	assert.Equal(c, m.Source, prefix+slash+"data")
 	assert.Equal(c, m.Destination, prefix+slash+"data")
-	if testEnv.OSType != "windows" { // Windows does not set mode
+	if testEnv.DaemonInfo.OSType != "windows" { // Windows does not set mode
 		assert.Equal(c, m.Mode, "ro"+modifier)
 	}
 	assert.Equal(c, m.RW, false)

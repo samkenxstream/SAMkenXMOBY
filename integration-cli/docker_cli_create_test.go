@@ -63,30 +63,6 @@ func (s *DockerCLICreateSuite) TestCreateArgs(c *testing.T) {
 	}
 }
 
-// Make sure we can grow the container's rootfs at creation time.
-func (s *DockerCLICreateSuite) TestCreateGrowRootfs(c *testing.T) {
-	// Windows and Devicemapper support growing the rootfs
-	if testEnv.OSType != "windows" {
-		testRequires(c, Devicemapper)
-	}
-	out, _ := dockerCmd(c, "create", "--storage-opt", "size=120G", "busybox")
-
-	cleanedContainerID := strings.TrimSpace(out)
-
-	inspectOut := inspectField(c, cleanedContainerID, "HostConfig.StorageOpt")
-	assert.Equal(c, inspectOut, "map[size:120G]")
-}
-
-// Make sure we cannot shrink the container's rootfs at creation time.
-func (s *DockerCLICreateSuite) TestCreateShrinkRootfs(c *testing.T) {
-	testRequires(c, Devicemapper)
-
-	// Ensure this fails because of the defaultBaseFsSize is 10G
-	out, _, err := dockerCmdWithError("create", "--storage-opt", "size=5G", "busybox")
-	assert.ErrorContains(c, err, "", out)
-	assert.Assert(c, strings.Contains(out, "Container size cannot be smaller than"))
-}
-
 // Make sure we can set hostconfig options too
 func (s *DockerCLICreateSuite) TestCreateHostConfig(c *testing.T) {
 	out, _ := dockerCmd(c, "create", "-P", "busybox", "echo")
@@ -225,7 +201,7 @@ func (s *DockerCLICreateSuite) TestCreateLabelFromImage(c *testing.T) {
 func (s *DockerCLICreateSuite) TestCreateHostnameWithNumber(c *testing.T) {
 	image := "busybox"
 	// Busybox on Windows does not implement hostname command
-	if testEnv.OSType == "windows" {
+	if testEnv.DaemonInfo.OSType == "windows" {
 		image = testEnv.PlatformDefaults.BaseImage
 	}
 	out, _ := dockerCmd(c, "run", "-h", "web.0", image, "hostname")
@@ -308,7 +284,7 @@ func (s *DockerCLICreateSuite) TestCreateWithWorkdir(c *testing.T) {
 
 	dockerCmd(c, "create", "--name", name, "-w", dir, "busybox")
 	// Windows does not create the workdir until the container is started
-	if testEnv.OSType == "windows" {
+	if testEnv.DaemonInfo.OSType == "windows" {
 		dockerCmd(c, "start", name)
 		if testEnv.DaemonInfo.Isolation.IsHyperV() {
 			// Hyper-V isolated containers do not allow file-operations on a

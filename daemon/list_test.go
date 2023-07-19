@@ -40,7 +40,7 @@ func setupContainerWithName(t *testing.T, name string, daemon *Daemon) *containe
 		computedImageID = image.ID(digest.FromString(id))
 		cRoot           = filepath.Join(root, id)
 	)
-	if err := os.MkdirAll(cRoot, 0755); err != nil {
+	if err := os.MkdirAll(cRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -87,10 +87,8 @@ func TestListInvalidFilter(t *testing.T) {
 		containersReplica: db,
 	}
 
-	f := filters.NewArgs(filters.Arg("invalid", "foo"))
-
 	_, err = d.Containers(context.Background(), &types.ContainerListOptions{
-		Filters: f,
+		Filters: filters.NewArgs(filters.Arg("invalid", "foo")),
 	})
 	assert.Assert(t, is.Error(err, "invalid filter 'invalid'"))
 }

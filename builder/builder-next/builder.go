@@ -14,8 +14,10 @@ import (
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
+	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/docker/docker/builder"
-	mobyexporter "github.com/docker/docker/builder/builder-next/exporter"
+	"github.com/docker/docker/builder/builder-next/exporter"
+	"github.com/docker/docker/builder/builder-next/exporter/mobyexporter"
 	"github.com/docker/docker/builder/builder-next/exporter/overrides"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/images"
@@ -53,6 +55,12 @@ func (e errConflictFilter) Error() string {
 
 func (errConflictFilter) InvalidParameter() {}
 
+type errInvalidFilterValue struct {
+	error
+}
+
+func (errInvalidFilterValue) InvalidParameter() {}
+
 var cacheFields = map[string]bool{
 	"id":          true,
 	"parent":      true,
@@ -70,7 +78,9 @@ var cacheFields = map[string]bool{
 type Opt struct {
 	SessionManager      *session.Manager
 	Root                string
+	EngineID            string
 	Dist                images.DistributionServices
+	ImageTagger         mobyexporter.ImageTagger
 	NetworkController   *libnetwork.Controller
 	DefaultCgroupParent string
 	RegistryHosts       docker.RegistryHosts
@@ -214,7 +224,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		return nil, errors.Errorf("multiple outputs not supported")
 	}
 
-	var rc = opt.Source
+	rc := opt.Source
 	if buildID := opt.Options.BuildID; buildID != "" {
 		b.mu.Lock()
 
@@ -345,11 +355,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 	exporterName := ""
 	exporterAttrs := map[string]string{}
 	if len(opt.Options.Outputs) == 0 {
-		if b.useSnapshotter {
-			exporterName = client.ExporterImage
-		} else {
-			exporterName = mobyexporter.Moby
-		}
+		exporterName = exporter.Moby
 	} else {
 		// cacheonly is a special type for triggering skipping all exporters
 		if opt.Options.Outputs[0].Type != "cacheonly" {
@@ -358,7 +364,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		}
 	}
 
-	if (exporterName == client.ExporterImage || exporterName == mobyexporter.Moby) && len(opt.Options.Tags) > 0 {
+	if (exporterName == client.ExporterImage || exporterName == exporter.Moby) && len(opt.Options.Tags) > 0 {
 		nameAttr, err := overrides.SanitizeRepoAndTags(opt.Options.Tags)
 		if err != nil {
 			return nil, err
@@ -401,7 +407,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		if err != nil {
 			return err
 		}
-		if exporterName != mobyexporter.Moby && exporterName != client.ExporterImage {
+		if exporterName != exporter.Moby && exporterName != client.ExporterImage {
 			return nil
 		}
 		id, ok := resp.ExporterResponse["containerimage.digest"]
@@ -460,6 +466,7 @@ func (sp *streamProxy) SetTrailer(_ grpcmetadata.MD) {
 func (sp *streamProxy) Context() context.Context {
 	return sp.ctx
 }
+
 func (sp *streamProxy) RecvMsg(m interface{}) error {
 	return io.EOF
 }
@@ -472,6 +479,7 @@ type statusProxy struct {
 func (sp *statusProxy) Send(resp *controlapi.StatusResponse) error {
 	return sp.SendMsg(resp)
 }
+
 func (sp *statusProxy) SendMsg(m interface{}) error {
 	if sr, ok := m.(*controlapi.StatusResponse); ok {
 		sp.ch <- sr
@@ -487,6 +495,7 @@ type pruneProxy struct {
 func (sp *pruneProxy) Send(resp *controlapi.UsageRecord) error {
 	return sp.SendMsg(resp)
 }
+
 func (sp *pruneProxy) SendMsg(m interface{}) error {
 	if sr, ok := m.(*controlapi.UsageRecord); ok {
 		sp.ch <- sr
@@ -626,11 +635,20 @@ func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, e
 	case 0:
 		// nothing to do
 	case 1:
-		var err error
-		until, err = time.ParseDuration(untilValues[0])
+		ts, err := timetypes.GetTimestamp(untilValues[0], time.Now())
 		if err != nil {
-			return client.PruneInfo{}, errors.Wrapf(err, "%q filter expects a duration (e.g., '24h')", filterKey)
+			return client.PruneInfo{}, errInvalidFilterValue{
+				errors.Wrapf(err, "%q filter expects a duration (e.g., '24h') or a timestamp", filterKey),
+			}
 		}
+		seconds, nanoseconds, err := timetypes.ParseTimestamps(ts, 0)
+		if err != nil {
+			return client.PruneInfo{}, errInvalidFilterValue{
+				errors.Wrapf(err, "failed to parse timestamp %q", ts),
+			}
+		}
+
+		until = time.Since(time.Unix(seconds, nanoseconds))
 	default:
 		return client.PruneInfo{}, errMultipleFilterValues{}
 	}

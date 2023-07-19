@@ -16,7 +16,7 @@ import (
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/system"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // ImportImage imports an image, getting the archived layer data from layerReader.
@@ -26,7 +26,7 @@ import (
 // If the platform is nil, the default host platform is used.
 // Message is used as the image's history comment.
 // Image configuration is derived from the dockerfile instructions in changes.
-func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, platform *specs.Platform, msg string, layerReader io.Reader, changes []string) (image.ID, error) {
+func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, platform *ocispec.Platform, msg string, layerReader io.Reader, changes []string) (image.ID, error) {
 	if platform == nil {
 		def := platforms.DefaultSpec()
 		platform = &def
@@ -58,7 +58,7 @@ func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, 
 			Architecture:  platform.Architecture,
 			Variant:       platform.Variant,
 			OS:            platform.OS,
-			Created:       created,
+			Created:       &created,
 			Comment:       msg,
 		},
 		RootFS: &image.RootFS{
@@ -66,7 +66,7 @@ func (i *ImageService) ImportImage(ctx context.Context, newRef reference.Named, 
 			DiffIDs: []layer.DiffID{l.DiffID()},
 		},
 		History: []image.History{{
-			Created: created,
+			Created: &created,
 			Comment: msg,
 		}},
 	})

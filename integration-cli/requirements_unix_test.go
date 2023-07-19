@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -12,10 +11,8 @@ import (
 	"github.com/docker/docker/pkg/sysinfo"
 )
 
-var (
-	// SysInfo stores information about which features a kernel supports.
-	SysInfo *sysinfo.SysInfo
-)
+// SysInfo stores information about which features a kernel supports.
+var SysInfo *sysinfo.SysInfo
 
 func cpuCfsPeriod() bool {
 	return testEnv.DaemonInfo.CPUCfsPeriod

@@ -1,12 +1,14 @@
 package container // import "github.com/docker/docker/daemon/cluster/executor/container"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 
+	"github.com/containerd/containerd/log"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	enginecontainer "github.com/docker/docker/api/types/container"
@@ -18,7 +20,7 @@ import (
 	"github.com/docker/docker/daemon/cluster/convert"
 	executorpkg "github.com/docker/docker/daemon/cluster/executor"
 	clustertypes "github.com/docker/docker/daemon/cluster/provider"
-	netconst "github.com/docker/docker/libnetwork/datastore"
+	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/go-connections/nat"
 	"github.com/docker/go-units"
 	gogotypes "github.com/gogo/protobuf/types"
@@ -26,7 +28,6 @@ import (
 	"github.com/moby/swarmkit/v2/api"
 	"github.com/moby/swarmkit/v2/api/genericresource"
 	"github.com/moby/swarmkit/v2/template"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -314,7 +315,10 @@ func convertMount(m api.Mount) enginemount.Mount {
 
 	if m.BindOptions != nil {
 		mount.BindOptions = &enginemount.BindOptions{
-			NonRecursive: m.BindOptions.NonRecursive,
+			NonRecursive:           m.BindOptions.NonRecursive,
+			CreateMountpoint:       m.BindOptions.CreateMountpoint,
+			ReadOnlyNonRecursive:   m.BindOptions.ReadOnlyNonRecursive,
+			ReadOnlyForceRecursive: m.BindOptions.ReadOnlyForceRecursive,
 		}
 		switch m.BindOptions.Propagation {
 		case api.MountPropagationRPrivate:
@@ -591,7 +595,7 @@ func (c *containerConfig) serviceConfig() *clustertypes.ServiceConfig {
 		return nil
 	}
 
-	logrus.Debugf("Creating service config in agent for t = %+v", c.task)
+	log.G(context.TODO()).Debugf("Creating service config in agent for t = %+v", c.task)
 	svcCfg := &clustertypes.ServiceConfig{
 		Name:             c.task.ServiceAnnotations.Name,
 		Aliases:          make(map[string][]string),
@@ -641,7 +645,7 @@ func (c *containerConfig) networkCreateRequest(name string) (clustertypes.Networ
 		Ingress:        convert.IsIngressNetwork(na.Network),
 		EnableIPv6:     na.Network.Spec.Ipv6Enabled,
 		CheckDuplicate: true,
-		Scope:          netconst.SwarmScope,
+		Scope:          datastore.SwarmScope,
 	}
 
 	if na.Network.Spec.GetNetwork() != "" {
@@ -716,10 +720,10 @@ func (c *containerConfig) applyPrivileges(hc *enginecontainer.HostConfig) {
 	}
 }
 
-func (c containerConfig) eventFilter() filters.Args {
-	filter := filters.NewArgs()
-	filter.Add("type", events.ContainerEventType)
-	filter.Add("name", c.name())
-	filter.Add("label", fmt.Sprintf("%v.task.id=%v", systemLabelPrefix, c.task.ID))
-	return filter
+func (c *containerConfig) eventFilter() filters.Args {
+	return filters.NewArgs(
+		filters.Arg("type", events.ContainerEventType),
+		filters.Arg("name", c.name()),
+		filters.Arg("label", fmt.Sprintf("%v.task.id=%v", systemLabelPrefix, c.task.ID)),
+	)
 }

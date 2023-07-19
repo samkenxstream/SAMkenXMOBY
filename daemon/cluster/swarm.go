@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/containerd/log"
 	apitypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	types "github.com/docker/docker/api/types/swarm"
@@ -18,7 +19,6 @@ import (
 	"github.com/moby/swarmkit/v2/manager/encryption"
 	swarmnode "github.com/moby/swarmkit/v2/node"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
@@ -87,7 +87,7 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 		if !found {
 			ip, err := c.resolveSystemAddr()
 			if err != nil {
-				logrus.Warnf("Could not find a local address: %v", err)
+				log.G(context.TODO()).Warnf("Could not find a local address: %v", err)
 				return "", errMustSpecifyListenAddr
 			}
 			localAddr = ip.String()
@@ -398,7 +398,7 @@ func (c *Cluster) Leave(ctx context.Context, force bool) error {
 	}
 	// release readers in here
 	if err := nr.Stop(); err != nil {
-		logrus.Errorf("failed to shut down cluster node: %v", err)
+		log.G(ctx).Errorf("failed to shut down cluster node: %v", err)
 		stack.Dump()
 		return err
 	}
@@ -414,7 +414,7 @@ func (c *Cluster) Leave(ctx context.Context, force bool) error {
 		}
 		for _, id := range nodeContainers {
 			if err := c.config.Backend.ContainerRm(id, &apitypes.ContainerRmConfig{ForceRemove: true}); err != nil {
-				logrus.Errorf("error removing %v: %v", id, err)
+				log.G(ctx).Errorf("error removing %v: %v", id, err)
 			}
 		}
 	}
@@ -606,10 +606,8 @@ func initClusterSpec(node *swarmnode.Node, spec types.Spec) error {
 
 func (c *Cluster) listContainerForNode(ctx context.Context, nodeID string) ([]string, error) {
 	var ids []string
-	filters := filters.NewArgs()
-	filters.Add("label", fmt.Sprintf("com.docker.swarm.node.id=%s", nodeID))
 	containers, err := c.config.Backend.Containers(ctx, &apitypes.ContainerListOptions{
-		Filters: filters,
+		Filters: filters.NewArgs(filters.Arg("label", "com.docker.swarm.node.id="+nodeID)),
 	})
 	if err != nil {
 		return []string{}, err

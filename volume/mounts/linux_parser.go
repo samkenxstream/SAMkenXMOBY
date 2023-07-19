@@ -30,6 +30,7 @@ func linuxValidateNotRoot(p string) error {
 	}
 	return nil
 }
+
 func linuxValidateAbsolute(p string) error {
 	p = strings.ReplaceAll(p, `\`, `/`)
 	if path.IsAbs(p) {
@@ -37,12 +38,14 @@ func linuxValidateAbsolute(p string) error {
 	}
 	return fmt.Errorf("invalid mount path: '%s' mount path must be absolute", p)
 }
+
 func (p *linuxParser) ValidateMountConfig(mnt *mount.Mount) error {
 	// there was something looking like a bug in existing codebase:
 	// - validateMountConfig on linux was called with options skipping bind source existence when calling ParseMountRaw
 	// - but not when calling ParseMountSpec directly... nor when the unit test called it directly
 	return p.validateMountConfigImpl(mnt, true)
 }
+
 func (p *linuxParser) validateMountConfigImpl(mnt *mount.Mount, validateBindSourceExists bool) error {
 	if len(mnt.Target) == 0 {
 		return &errMountConfig{mnt, errMissingField("Target")}
@@ -123,6 +126,7 @@ var linuxConsistencyModes = map[mount.Consistency]bool{
 	mount.ConsistencyCached:    true,
 	mount.ConsistencyDelegated: true,
 }
+
 var linuxPropagationModes = map[mount.Propagation]bool{
 	mount.PropagationPrivate:  true,
 	mount.PropagationRPrivate: true,
@@ -194,7 +198,7 @@ func (p *linuxParser) ReadWrite(mode string) bool {
 	}
 
 	for _, o := range strings.Split(mode, ",") {
-		if o == "ro" {
+		if o == "ro" || strings.HasPrefix(o, "ro-") || o == "rro" {
 			return false
 		}
 	}
@@ -262,6 +266,24 @@ func (p *linuxParser) ParseMountRaw(raw, volumeDriver string) (*MountPoint, erro
 		}
 	}
 
+	for _, m := range strings.Split(mode, ",") {
+		m = strings.TrimSpace(m)
+		if strings.HasPrefix(m, "ro-") || m == "rro" {
+			if spec.Type != mount.TypeBind {
+				return nil, fmt.Errorf("mount mode %q requires a bind mount: %w", mode, errInvalidSpec(raw))
+			}
+			if spec.BindOptions == nil {
+				spec.BindOptions = &mount.BindOptions{}
+			}
+			switch m {
+			case "ro-non-recursive":
+				spec.BindOptions.ReadOnlyNonRecursive = true
+			case "ro-force-recursive", "rro":
+				spec.BindOptions.ReadOnlyForceRecursive = true
+			}
+		}
+	}
+
 	mp, err := p.parseMountSpec(spec, false)
 	if mp != nil {
 		mp.Mode = mode
@@ -271,9 +293,11 @@ func (p *linuxParser) ParseMountRaw(raw, volumeDriver string) (*MountPoint, erro
 	}
 	return mp, err
 }
+
 func (p *linuxParser) ParseMountSpec(cfg mount.Mount) (*MountPoint, error) {
 	return p.parseMountSpec(cfg, true)
 }
+
 func (p *linuxParser) parseMountSpec(cfg mount.Mount, validateBindSourceExists bool) (*MountPoint, error) {
 	if err := p.validateMountConfigImpl(&cfg, validateBindSourceExists); err != nil {
 		return nil, err
@@ -328,6 +352,9 @@ func (p *linuxParser) ParseVolumesFrom(spec string) (string, string, error) {
 	}
 	if !linuxValidMountMode(mode) {
 		return "", "", errInvalidMode(mode)
+	}
+	if strings.HasPrefix(mode, "ro-") || mode == "rro" {
+		return "", "", fmt.Errorf("mount mode %q is not supported for volumes-from mounts: %w", mode, errInvalidMode(mode))
 	}
 	// For now don't allow propagation properties while importing
 	// volumes from data container. These volumes will inherit
@@ -394,6 +421,7 @@ func (p *linuxParser) ConvertTmpfsOptions(opt *mount.TmpfsOptions, readOnly bool
 func (p *linuxParser) DefaultCopyMode() bool {
 	return true
 }
+
 func (p *linuxParser) ValidateVolumeName(name string) error {
 	return nil
 }

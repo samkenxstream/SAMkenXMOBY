@@ -24,7 +24,7 @@ import (
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
@@ -41,7 +41,7 @@ func (ir *imageRouter) postImagesCreate(ctx context.Context, w http.ResponseWrit
 		comment     = r.Form.Get("message")
 		progressErr error
 		output      = ioutils.NewWriteFlusher(w)
-		platform    *specs.Platform
+		platform    *ocispec.Platform
 	)
 	defer output.Close()
 
@@ -263,6 +263,10 @@ func (ir *imageRouter) getImagesByName(ctx context.Context, w http.ResponseWrite
 		return err
 	}
 
+	version := httputils.VersionFromContext(ctx)
+	if versions.LessThan(version, "1.44") {
+		imageInspect.VirtualSize = imageInspect.Size //nolint:staticcheck // ignore SA1019: field is deprecated, but still set on API < v1.44.
+	}
 	return httputils.WriteJSON(w, http.StatusOK, imageInspect)
 }
 
@@ -282,13 +286,26 @@ func (ir *imageRouter) toImageInspect(img *image.Image) (*types.ImageInspect, er
 		comment = img.History[len(img.History)-1].Comment
 	}
 
+	// Make sure we output empty arrays instead of nil.
+	if repoTags == nil {
+		repoTags = []string{}
+	}
+	if repoDigests == nil {
+		repoDigests = []string{}
+	}
+
+	var created string
+	if img.Created != nil {
+		created = img.Created.Format(time.RFC3339Nano)
+	}
+
 	return &types.ImageInspect{
 		ID:              img.ID().String(),
 		RepoTags:        repoTags,
 		RepoDigests:     repoDigests,
 		Parent:          img.Parent.String(),
 		Comment:         comment,
-		Created:         img.Created.Format(time.RFC3339Nano),
+		Created:         created,
 		Container:       img.Container,
 		ContainerConfig: &img.ContainerConfig,
 		DockerVersion:   img.DockerVersion,
@@ -299,7 +316,6 @@ func (ir *imageRouter) toImageInspect(img *image.Image) (*types.ImageInspect, er
 		Os:              img.OperatingSystem(),
 		OsVersion:       img.OSVersion,
 		Size:            img.Details.Size,
-		VirtualSize:     img.Details.Size, // TODO: field unused, deprecate
 		GraphDriver: types.GraphDriverData{
 			Name: img.Details.Driver,
 			Data: img.Details.Metadata,
@@ -356,8 +372,10 @@ func (ir *imageRouter) getImagesJSON(ctx context.Context, w http.ResponseWriter,
 		return err
 	}
 
+	useNone := versions.LessThan(version, "1.43")
+	withVirtualSize := versions.LessThan(version, "1.44")
 	for _, img := range images {
-		if versions.LessThan(version, "1.43") {
+		if useNone {
 			if len(img.RepoTags) == 0 && len(img.RepoDigests) == 0 {
 				img.RepoTags = append(img.RepoTags, "<none>:<none>")
 				img.RepoDigests = append(img.RepoDigests, "<none>@<none>")
@@ -369,6 +387,9 @@ func (ir *imageRouter) getImagesJSON(ctx context.Context, w http.ResponseWriter,
 			if img.RepoDigests == nil {
 				img.RepoDigests = []string{}
 			}
+		}
+		if withVirtualSize {
+			img.VirtualSize = img.Size //nolint:staticcheck // ignore SA1019: field is deprecated, but still set on API < v1.44.
 		}
 	}
 
@@ -428,7 +449,7 @@ func (ir *imageRouter) getImagesSearch(ctx context.Context, w http.ResponseWrite
 	// AuthConfig to increase compatibility with the existing API.
 	authConfig, _ := registry.DecodeAuthConfig(r.Header.Get(registry.AuthHeader))
 
-	var headers = http.Header{}
+	headers := http.Header{}
 	for k, v := range r.Header {
 		k = http.CanonicalHeaderKey(k)
 		if strings.HasPrefix(k, "X-Meta-") {

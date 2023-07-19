@@ -13,11 +13,10 @@ import (
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 	ctr "github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/oci"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
@@ -25,7 +24,7 @@ import (
 )
 
 func TestCreateFailsWhenIdentifierDoesNotExist(t *testing.T) {
-	defer setupTest(t)()
+	t.Cleanup(setupTest(t))
 	client := testEnv.APIClient()
 
 	testCases := []struct {
@@ -91,7 +90,7 @@ func TestCreateLinkToNonExistingContainer(t *testing.T) {
 }
 
 func TestCreateWithInvalidEnv(t *testing.T) {
-	defer setupTest(t)()
+	t.Cleanup(setupTest(t))
 	client := testEnv.APIClient()
 
 	testCases := []struct {
@@ -177,6 +176,7 @@ func TestCreateTmpfsMountsTarget(t *testing.T) {
 		assert.Check(t, errdefs.IsInvalidParameter(err))
 	}
 }
+
 func TestCreateWithCustomMaskedPaths(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
 
@@ -337,7 +337,7 @@ func TestCreateWithCustomReadonlyPaths(t *testing.T) {
 }
 
 func TestCreateWithInvalidHealthcheckParams(t *testing.T) {
-	defer setupTest(t)()
+	t.Cleanup(setupTest(t))
 	client := testEnv.APIClient()
 	ctx := context.Background()
 
@@ -475,22 +475,22 @@ func TestCreateDifferentPlatform(t *testing.T) {
 	assert.Assert(t, img.Architecture != "")
 
 	t.Run("different os", func(t *testing.T) {
-		p := specs.Platform{
+		p := ocispec.Platform{
 			OS:           img.Os + "DifferentOS",
 			Architecture: img.Architecture,
 			Variant:      img.Variant,
 		}
 		_, err := c.ContainerCreate(ctx, &containertypes.Config{Image: "busybox:latest"}, &containertypes.HostConfig{}, nil, &p, "")
-		assert.Assert(t, client.IsErrNotFound(err), err)
+		assert.Check(t, is.ErrorType(err, errdefs.IsNotFound))
 	})
 	t.Run("different cpu arch", func(t *testing.T) {
-		p := specs.Platform{
+		p := ocispec.Platform{
 			OS:           img.Os,
 			Architecture: img.Architecture + "DifferentArch",
 			Variant:      img.Variant,
 		}
 		_, err := c.ContainerCreate(ctx, &containertypes.Config{Image: "busybox:latest"}, &containertypes.HostConfig{}, nil, &p, "")
-		assert.Assert(t, client.IsErrNotFound(err), err)
+		assert.Check(t, is.ErrorType(err, errdefs.IsNotFound))
 	})
 }
 
@@ -515,7 +515,7 @@ func TestCreatePlatformSpecificImageNoPlatform(t *testing.T) {
 	defer setupTest(t)()
 
 	skip.If(t, testEnv.DaemonInfo.Architecture == "arm", "test only makes sense to run on non-arm systems")
-	skip.If(t, testEnv.OSType != "linux", "test image is only available on linux")
+	skip.If(t, testEnv.DaemonInfo.OSType != "linux", "test image is only available on linux")
 	cli := testEnv.APIClient()
 
 	_, err := cli.ContainerCreate(
@@ -532,7 +532,7 @@ func TestCreatePlatformSpecificImageNoPlatform(t *testing.T) {
 func TestCreateInvalidHostConfig(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	defer setupTest(t)()
+	t.Cleanup(setupTest(t))
 	apiClient := testEnv.APIClient()
 	ctx := context.Background()
 

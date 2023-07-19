@@ -17,6 +17,16 @@ const (
 	SandboxTypeLoadBalancer = iota
 )
 
+type Iface struct {
+	SrcName, DstPrefix string
+}
+
+// IfaceOption is a function option type to set interface options.
+type IfaceOption func(i *nwIface)
+
+// NeighOption is a function option type to set neighbor options.
+type NeighOption func(nh *neigh)
+
 // Sandbox represents a network sandbox, identified by a specific key.  It
 // holds a list of Interfaces, routes etc, and more can be added dynamically.
 type Sandbox interface {
@@ -83,7 +93,7 @@ type Sandbox interface {
 	Destroy() error
 
 	// Restore restores the sandbox.
-	Restore(ifsopt map[string][]IfaceOption, routes []*types.StaticRoute, gw net.IP, gw6 net.IP) error
+	Restore(ifsopt map[Iface][]IfaceOption, routes []*types.StaticRoute, gw net.IP, gw6 net.IP) error
 
 	// ApplyOSTweaks applies operating system specific knobs on the sandbox.
 	ApplyOSTweaks([]SandboxType)

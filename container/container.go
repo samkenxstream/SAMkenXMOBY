@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/cio"
+	"github.com/containerd/containerd/log"
 	containertypes "github.com/docker/docker/api/types/container"
 	mounttypes "github.com/docker/docker/api/types/mount"
 	swarmtypes "github.com/docker/docker/api/types/swarm"
@@ -41,7 +42,6 @@ import (
 	"github.com/moby/sys/symlink"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -79,9 +79,7 @@ type Container struct {
 	Name            string
 	Driver          string
 	OS              string
-	// MountLabel contains the options for the 'mount' command
-	MountLabel               string
-	ProcessLabel             string
+
 	RestartCount             int
 	HasBeenStartedBefore     bool
 	HasBeenManuallyStopped   bool // used for unless-stopped restart policy
@@ -99,18 +97,25 @@ type Container struct {
 	attachContext  *attachContext
 
 	// Fields here are specific to Unix platforms
-	AppArmorProfile string
-	HostnamePath    string
-	HostsPath       string
-	ShmPath         string
-	ResolvConfPath  string
-	SeccompProfile  string
-	NoNewPrivileges bool
+	SecurityOptions
+	HostnamePath   string
+	HostsPath      string
+	ShmPath        string
+	ResolvConfPath string
 
 	// Fields here are specific to Windows
 	NetworkSharedContainerID string            `json:"-"`
 	SharedEndpointList       []string          `json:"-"`
 	LocalLogCacheMeta        localLogCacheMeta `json:",omitempty"`
+}
+
+type SecurityOptions struct {
+	// MountLabel contains the options for the "mount" command.
+	MountLabel      string
+	ProcessLabel    string
+	AppArmorProfile string
+	SeccompProfile  string
+	NoNewPrivileges bool
 }
 
 type localLogCacheMeta struct {
@@ -312,7 +317,7 @@ func (container *Container) GetResourcePath(path string) (string, error) {
 	// from the error being propagated all the way back to the client. This makes
 	// debugging significantly easier and clearly indicates the error comes from the daemon.
 	if e != nil {
-		logrus.Errorf("Failed to ResolveScopedPath BaseFS %s path %s %s\n", container.BaseFS, path, e)
+		log.G(context.TODO()).Errorf("Failed to ResolveScopedPath BaseFS %s path %s %s\n", container.BaseFS, path, e)
 	}
 	return r, e
 }
@@ -427,7 +432,7 @@ func (container *Container) StartLogger() (logger.Logger, error) {
 			}
 
 			if !container.LocalLogCacheMeta.HaveNotifyEnabled {
-				logrus.WithField("container", container.ID).WithField("driver", container.HostConfig.LogConfig.Type).Info("Configured log driver does not support reads, enabling local file cache for container logs")
+				log.G(context.TODO()).WithField("container", container.ID).WithField("driver", container.HostConfig.LogConfig.Type).Info("Configured log driver does not support reads, enabling local file cache for container logs")
 				container.LocalLogCacheMeta.HaveNotifyEnabled = true
 			}
 			info.LogPath = logPath
@@ -668,7 +673,7 @@ func (container *Container) InitializeStdio(iop *cio.DirectIO) (cio.IO, error) {
 	if container.StreamConfig.Stdin() == nil && !container.Config.Tty {
 		if iop.Stdin != nil {
 			if err := iop.Stdin.Close(); err != nil {
-				logrus.Warnf("error closing stdin: %+v", err)
+				log.G(context.TODO()).Warnf("error closing stdin: %+v", err)
 			}
 		}
 	}

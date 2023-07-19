@@ -14,6 +14,7 @@ import (
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
+	"github.com/opencontainers/go-digest"
 )
 
 const (
@@ -44,8 +45,7 @@ type Backend interface {
 	CommitBuildStep(context.Context, backend.CommitConfig) (image.ID, error)
 	// ContainerCreateWorkdir creates the workdir
 	ContainerCreateWorkdir(containerID string) error
-
-	CreateImage(config []byte, parent string) (Image, error)
+	CreateImage(ctx context.Context, config []byte, parent string, contentStoreDigest digest.Digest) (Image, error)
 
 	ImageCacheBuilder
 }
@@ -104,6 +104,7 @@ type ROLayer interface {
 	Release() error
 	NewRWLayer() (RWLayer, error)
 	DiffID() layer.DiffID
+	ContentStoreDigest() digest.Digest
 }
 
 // RWLayer is active layer that can be read/modified

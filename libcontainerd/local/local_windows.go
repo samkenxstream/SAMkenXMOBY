@@ -15,11 +15,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/Microsoft/hcsshim"
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cio"
-	containerderrdefs "github.com/containerd/containerd/errdefs"
-
+	cerrdefs "github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libcontainerd/queue"
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
@@ -27,7 +29,6 @@ import (
 	"github.com/docker/docker/pkg/system"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/windows"
 )
 
@@ -89,7 +90,7 @@ func NewClient(ctx context.Context, cli *containerd.Client, stateDir, ns string,
 	c := &client{
 		stateDir: stateDir,
 		backend:  b,
-		logger:   logrus.WithField("module", "libcontainerd").WithField("namespace", ns),
+		logger:   log.G(ctx).WithField("module", "libcontainerd").WithField("namespace", ns),
 	}
 
 	return c, nil
@@ -356,7 +357,6 @@ func (c *client) createWindows(id string, spec *specs.Spec, runtimeOptions inter
 
 	logger.Debug("createWindows() completed successfully")
 	return ctr, nil
-
 }
 
 func (c *client) extractResourcesFromSpec(spec *specs.Spec, configuration *hcsshim.ContainerConfig) {
@@ -397,7 +397,7 @@ func (ctr *container) Start(_ context.Context, _ string, withStdin bool, attachS
 	case ctr.ociSpec == nil:
 		return nil, errors.WithStack(errdefs.NotImplemented(errors.New("a restored container cannot be started")))
 	case ctr.task != nil:
-		return nil, errors.WithStack(errdefs.NotModified(containerderrdefs.ErrAlreadyExists))
+		return nil, errors.WithStack(errdefs.NotModified(cerrdefs.ErrAlreadyExists))
 	}
 
 	logger := ctr.client.logger.WithField("container", ctr.id)
@@ -520,7 +520,7 @@ func (ctr *container) Task(context.Context) (libcontainerdtypes.Task, error) {
 	ctr.mu.Lock()
 	defer ctr.mu.Unlock()
 	if ctr.task == nil {
-		return nil, errdefs.NotFound(containerderrdefs.ErrNotFound)
+		return nil, errdefs.NotFound(cerrdefs.ErrNotFound)
 	}
 	return ctr.task, nil
 }
@@ -772,7 +772,7 @@ func (p *process) CloseStdin(context.Context) error {
 // Pause handles pause requests for containers
 func (t *task) Pause(_ context.Context) error {
 	if t.ctr.ociSpec.Windows.HyperV == nil {
-		return containerderrdefs.ErrNotImplemented
+		return cerrdefs.ErrNotImplemented
 	}
 
 	t.ctr.mu.Lock()
@@ -908,7 +908,7 @@ func (c *client) LoadContainer(ctx context.Context, id string) (libcontainerdtyp
 // re-attach isn't possible (see LoadContainer), a NotFound error is
 // unconditionally returned to allow restore to make progress.
 func (*container) AttachTask(context.Context, libcontainerdtypes.StdioCallback) (libcontainerdtypes.Task, error) {
-	return nil, errdefs.NotFound(containerderrdefs.ErrNotImplemented)
+	return nil, errdefs.NotFound(cerrdefs.ErrNotImplemented)
 }
 
 // Pids returns a list of process IDs running in a container. It is not
