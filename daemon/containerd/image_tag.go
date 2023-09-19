@@ -6,11 +6,11 @@ import (
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/log"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // TagImage creates an image named as newTag and targeting the given descriptor id.
@@ -40,7 +40,7 @@ func (i *ImageService) TagImage(ctx context.Context, imageID image.ID, newTag re
 		// Check if image we would replace already resolves to the same target.
 		// No need to do anything.
 		if replacedImg.Target.Digest == target.Digest {
-			i.LogImageEvent(imageID.String(), reference.FamiliarString(newTag), "tag")
+			i.LogImageEvent(imageID.String(), reference.FamiliarString(newTag), events.ActionTag)
 			return nil
 		}
 
@@ -55,13 +55,13 @@ func (i *ImageService) TagImage(ctx context.Context, imageID image.ID, newTag re
 		}
 	}
 
-	logger := log.G(ctx).WithFields(logrus.Fields{
+	logger := log.G(ctx).WithFields(log.Fields{
 		"imageID": imageID.String(),
 		"tag":     newTag.String(),
 	})
 	logger.Info("image created")
 
-	defer i.LogImageEvent(imageID.String(), reference.FamiliarString(newTag), "tag")
+	defer i.LogImageEvent(imageID.String(), reference.FamiliarString(newTag), events.ActionTag)
 
 	// The tag succeeded, check if the source image is dangling
 	sourceDanglingImg, err := is.Get(context.Background(), danglingImageName(target.Digest))
@@ -71,6 +71,17 @@ func (i *ImageService) TagImage(ctx context.Context, imageID image.ID, newTag re
 		}
 
 		return nil
+	}
+
+	builderLabel, ok := sourceDanglingImg.Labels[imageLabelClassicBuilderParent]
+	if ok {
+		newImg.Labels = map[string]string{
+			imageLabelClassicBuilderParent: builderLabel,
+		}
+
+		if _, err := is.Update(context.Background(), newImg, "labels"); err != nil {
+			logger.WithError(err).Warnf("failed to set %s label on the newly tagged image", imageLabelClassicBuilderParent)
+		}
 	}
 
 	// Delete the source dangling image, as it's no longer dangling.

@@ -89,7 +89,7 @@ func (daemon *Daemon) ContainersPrune(ctx context.Context, pruneFilters filters.
 			rep.ContainersDeleted = append(rep.ContainersDeleted, c.ID)
 		}
 	}
-	daemon.EventsService.Log("prune", events.ContainerEventType, events.Actor{
+	daemon.EventsService.Log(events.ActionPrune, events.ContainerEventType, events.Actor{
 		Attributes: map[string]string{"reclaimed": strconv.FormatUint(rep.SpaceReclaimed, 10)},
 	})
 	return rep, nil
@@ -102,20 +102,20 @@ func (daemon *Daemon) localNetworksPrune(ctx context.Context, pruneFilters filte
 	until, _ := getUntilFromPruneFilters(pruneFilters)
 
 	// When the function returns true, the walk will stop.
-	l := func(nw libnetwork.Network) bool {
+	daemon.netController.WalkNetworks(func(nw *libnetwork.Network) bool {
 		select {
 		case <-ctx.Done():
 			// context cancelled
 			return true
 		default:
 		}
-		if nw.Info().ConfigOnly() {
+		if nw.ConfigOnly() {
 			return false
 		}
-		if !until.IsZero() && nw.Info().Created().After(until) {
+		if !until.IsZero() && nw.Created().After(until) {
 			return false
 		}
-		if !matchLabels(pruneFilters, nw.Info().Labels()) {
+		if !matchLabels(pruneFilters, nw.Labels()) {
 			return false
 		}
 		nwName := nw.Name()
@@ -131,8 +131,7 @@ func (daemon *Daemon) localNetworksPrune(ctx context.Context, pruneFilters filte
 		}
 		rep.NetworksDeleted = append(rep.NetworksDeleted, nwName)
 		return false
-	}
-	daemon.netController.WalkNetworks(l)
+	})
 	return rep
 }
 
@@ -217,7 +216,7 @@ func (daemon *Daemon) NetworksPrune(ctx context.Context, pruneFilters filters.Ar
 		return rep, nil
 	default:
 	}
-	daemon.EventsService.Log("prune", events.NetworkEventType, events.Actor{
+	daemon.EventsService.Log(events.ActionPrune, events.NetworkEventType, events.Actor{
 		Attributes: map[string]string{"reclaimed": "0"},
 	})
 	return rep, nil

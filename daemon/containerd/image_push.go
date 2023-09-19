@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -15,9 +17,11 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -25,7 +29,8 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// PushImage initiates a push operation of the image pointed to by targetRef.
+// PushImage initiates a push operation of the image pointed to by sourceRef.
+// If reference is untagged, all tags from the reference repository are pushed.
 // Image manifest (or index) is pushed as is, which will probably fail if you
 // don't have all content referenced by the index.
 // Cross-repo mounts will be attempted for non-existing blobs.
@@ -34,25 +39,54 @@ import (
 // pointing to the new target repository. This will allow subsequent pushes
 // to perform cross-repo mounts of the shared content when pushing to a different
 // repository on the same registry.
-func (i *ImageService) PushImage(ctx context.Context, targetRef reference.Named, metaHeaders map[string][]string, authConfig *registry.AuthConfig, outStream io.Writer) error {
-	if _, tagged := targetRef.(reference.Tagged); !tagged {
-		if _, digested := targetRef.(reference.Digested); !digested {
-			return errdefs.NotImplemented(errors.New("push all tags is not implemented"))
+func (i *ImageService) PushImage(ctx context.Context, sourceRef reference.Named, metaHeaders map[string][]string, authConfig *registry.AuthConfig, outStream io.Writer) (retErr error) {
+	out := streamformatter.NewJSONProgressOutput(outStream, false)
+	progress.Messagef(out, "", "The push refers to repository [%s]", sourceRef.Name())
+
+	if _, tagged := sourceRef.(reference.Tagged); !tagged {
+		if _, digested := sourceRef.(reference.Digested); !digested {
+			// Image is not tagged nor digested, that means all tags push was requested.
+
+			// Find all images with the same repository.
+			nameFilter := "^" + regexp.QuoteMeta(sourceRef.Name()) + ":" + reference.TagRegexp.String() + "$"
+			imgs, err := i.client.ImageService().List(ctx, "name~="+strconv.Quote(nameFilter))
+			if err != nil {
+				return err
+			}
+
+			for _, img := range imgs {
+				named, err := reference.ParseNamed(img.Name)
+				if err != nil {
+					// This shouldn't happen, but log a warning just in case.
+					log.G(ctx).WithFields(log.Fields{
+						"image":     img.Name,
+						"sourceRef": sourceRef,
+					}).Warn("refusing to push an invalid tag")
+					continue
+				}
+
+				if err := i.pushRef(ctx, named, metaHeaders, authConfig, out); err != nil {
+					return err
+				}
+			}
+
+			return nil
 		}
 	}
 
+	return i.pushRef(ctx, sourceRef, metaHeaders, authConfig, out)
+}
+
+func (i *ImageService) pushRef(ctx context.Context, targetRef reference.Named, metaHeaders map[string][]string, authConfig *registry.AuthConfig, out progress.Output) (retErr error) {
 	leasedCtx, release, err := i.client.WithLease(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		err := release(leasedCtx)
-		if err != nil && !cerrdefs.IsNotFound(err) {
-			log.G(ctx).WithField("image", targetRef).WithError(err).Error("failed to delete lease created for push")
+		if err := release(leasedCtx); err != nil {
+			log.G(ctx).WithField("image", targetRef).WithError(err).Warn("failed to release lease created for push")
 		}
 	}()
-
-	out := streamformatter.NewJSONProgressOutput(outStream, false)
 
 	img, err := i.client.ImageService().Get(ctx, targetRef.String())
 	if err != nil {
@@ -63,13 +97,20 @@ func (i *ImageService) PushImage(ctx context.Context, targetRef reference.Named,
 	store := i.client.ContentStore()
 
 	resolver, tracker := i.newResolverFromAuthConfig(ctx, authConfig)
-	progress := pushProgress{Tracker: tracker}
+	pp := pushProgress{Tracker: tracker}
 	jobsQueue := newJobs()
 	finishProgress := jobsQueue.showProgress(ctx, out, combinedProgress([]progressUpdater{
-		&progress,
-		pullProgress{ShowExists: false, Store: store},
+		&pp,
+		pullProgress{showExists: false, store: store},
 	}))
-	defer finishProgress()
+	defer func() {
+		finishProgress()
+		if retErr == nil {
+			if tagged, ok := targetRef.(reference.Tagged); ok {
+				progress.Messagef(out, "", "%s: digest: %s size: %d", tagged.Tag(), target.Digest, img.Target.Size)
+			}
+		}
+	}()
 
 	var limiter *semaphore.Weighted = nil // TODO: Respect max concurrent downloads/uploads
 
@@ -78,7 +119,7 @@ func (i *ImageService) PushImage(ctx context.Context, targetRef reference.Named,
 		return err
 	}
 	for dgst := range mountableBlobs {
-		progress.addMountable(dgst)
+		pp.addMountable(dgst)
 	}
 
 	// Create a store which fakes the local existence of possibly mountable blobs.
@@ -140,6 +181,9 @@ func (i *ImageService) PushImage(ctx context.Context, targetRef reference.Named,
 		}
 	}
 
+	if err == nil {
+		i.LogImageEvent(reference.FamiliarString(targetRef), reference.FamiliarName(targetRef), events.ActionPush)
+	}
 	return err
 }
 

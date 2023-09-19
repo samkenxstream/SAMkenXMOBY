@@ -3,6 +3,7 @@ package containerd
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,16 +12,25 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/labels"
 	"github.com/containerd/containerd/log"
-	"github.com/docker/distribution/reference"
+	"github.com/containerd/containerd/snapshots"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
 	timetypes "github.com/docker/docker/api/types/time"
+	"github.com/docker/docker/errdefs"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
+
+// Subset of ocispec.Image that only contains Labels
+type configLabels struct {
+	Config struct {
+		Labels map[string]string `json:"Labels,omitempty"`
+	} `json:"config,omitempty"`
+}
 
 var acceptedImageFilterTags = map[string]bool{
 	"dangling":  true,
@@ -32,11 +42,17 @@ var acceptedImageFilterTags = map[string]bool{
 	"until":     true,
 }
 
+// byCreated is a temporary type used to sort a list of images by creation
+// time.
+type byCreated []*types.ImageSummary
+
+func (r byCreated) Len() int           { return len(r) }
+func (r byCreated) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+func (r byCreated) Less(i, j int) bool { return r[i].Created < r[j].Created }
+
 // Images returns a filtered list of images.
 //
-// TODO(thaJeztah): sort the results by created (descending); see https://github.com/moby/moby/issues/43848
 // TODO(thaJeztah): implement opts.ContainerCount (used for docker system df); see https://github.com/moby/moby/issues/43853
-// TODO(thaJeztah): add labels to results; see https://github.com/moby/moby/issues/43852
 // TODO(thaJeztah): verify behavior of `RepoDigests` and `RepoTags` for images without (untagged) or multiple tags; see https://github.com/moby/moby/issues/43861
 // TODO(thaJeztah): verify "Size" vs "VirtualSize" in images; see https://github.com/moby/moby/issues/43862
 func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) ([]*types.ImageSummary, error) {
@@ -44,12 +60,12 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 		return nil, err
 	}
 
-	listFilters, filter, err := i.setupFilters(ctx, opts.Filters)
+	filter, err := i.setupFilters(ctx, opts.Filters)
 	if err != nil {
 		return nil, err
 	}
 
-	imgs, err := i.client.ImageService().List(ctx, listFilters...)
+	imgs, err := i.client.ImageService().List(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -80,11 +96,55 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 	}
 
 	contentStore := i.client.ContentStore()
+	uniqueImages := map[digest.Digest]images.Image{}
+	tagsByDigest := map[digest.Digest][]string{}
+	intermediateImages := map[digest.Digest]struct{}{}
+
+	hideIntermediate := !opts.All
+	if hideIntermediate {
+		for _, img := range imgs {
+			parent, ok := img.Labels[imageLabelClassicBuilderParent]
+			if ok && parent != "" {
+				dgst, err := digest.Parse(parent)
+				if err != nil {
+					log.G(ctx).WithFields(log.Fields{
+						"error": err,
+						"value": parent,
+					}).Warnf("invalid %s label value", imageLabelClassicBuilderParent)
+				}
+				intermediateImages[dgst] = struct{}{}
+			}
+		}
+	}
+
 	for _, img := range imgs {
+		isDangling := isDanglingImage(img)
+
+		if hideIntermediate && isDangling {
+			if _, ok := intermediateImages[img.Target.Digest]; ok {
+				continue
+			}
+		}
+
 		if !filter(img) {
 			continue
 		}
 
+		dgst := img.Target.Digest
+		uniqueImages[dgst] = img
+
+		if isDangling {
+			continue
+		}
+
+		ref, err := reference.ParseNormalizedNamed(img.Name)
+		if err != nil {
+			continue
+		}
+		tagsByDigest[dgst] = append(tagsByDigest[dgst], reference.FamiliarString(ref))
+	}
+
+	for _, img := range uniqueImages {
 		err := i.walkImageManifests(ctx, img, func(img *ImageManifest) error {
 			if isPseudo, err := img.IsPseudoImage(ctx); isPseudo || err != nil {
 				return err
@@ -92,10 +152,10 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 
 			available, err := img.CheckContentAvailable(ctx)
 			if err != nil {
-				log.G(ctx).WithFields(logrus.Fields{
-					logrus.ErrorKey: err,
-					"manifest":      img.Target(),
-					"image":         img.Name(),
+				log.G(ctx).WithFields(log.Fields{
+					"error":    err,
+					"manifest": img.Target(),
+					"image":    img.Name(),
 				}).Warn("checking availability of platform specific manifest failed")
 				return nil
 			}
@@ -104,7 +164,7 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 				return nil
 			}
 
-			image, chainIDs, err := i.singlePlatformImage(ctx, contentStore, img)
+			image, chainIDs, err := i.singlePlatformImage(ctx, contentStore, tagsByDigest[img.RealTarget.Digest], img)
 			if err != nil {
 				return err
 			}
@@ -136,53 +196,46 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 		}
 	}
 
+	sort.Sort(sort.Reverse(byCreated(summaries)))
+
 	return summaries, nil
 }
 
-func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore content.Store, image *ImageManifest) (*types.ImageSummary, []digest.Digest, error) {
+func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore content.Store, repoTags []string, image *ImageManifest) (*types.ImageSummary, []digest.Digest, error) {
 	diffIDs, err := image.RootFS(ctx)
 	if err != nil {
-		return nil, nil, err
-	}
-	chainIDs := identity.ChainIDs(diffIDs)
-
-	size, err := image.Size(ctx)
-	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Wrapf(err, "failed to get rootfs of image %s", image.Name())
 	}
 
 	// TODO(thaJeztah): do we need to take multiple snapshotters into account? See https://github.com/moby/moby/issues/45273
 	snapshotter := i.client.SnapshotService(i.snapshotter)
-	sizeCache := make(map[digest.Digest]int64)
 
-	snapshotSizeFn := func(d digest.Digest) (int64, error) {
-		if s, ok := sizeCache[d]; ok {
-			return s, nil
+	imageSnapshotID := identity.ChainID(diffIDs).String()
+	unpackedUsage, err := calculateSnapshotTotalUsage(ctx, snapshotter, imageSnapshotID)
+	if err != nil {
+		if !cerrdefs.IsNotFound(err) {
+			log.G(ctx).WithError(err).WithFields(log.Fields{
+				"image":      image.Name(),
+				"snapshotID": imageSnapshotID,
+			}).Warn("failed to calculate unpacked size of image")
 		}
-		usage, err := snapshotter.Usage(ctx, d.String())
-		if err != nil {
-			if cerrdefs.IsNotFound(err) {
-				return 0, nil
-			}
-			return 0, err
-		}
-		sizeCache[d] = usage.Size
-		return usage.Size, nil
+		unpackedUsage = snapshots.Usage{Size: 0}
 	}
-	snapshotSize, err := computeSnapshotSize(chainIDs, snapshotSizeFn)
+
+	contentSize, err := image.Size(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// totalSize is the size of the image's packed layers and snapshots
 	// (unpacked layers) combined.
-	totalSize := size + snapshotSize
+	totalSize := contentSize + unpackedUsage.Size
 
-	var repoTags, repoDigests []string
+	var repoDigests []string
 	rawImg := image.Metadata()
 	target := rawImg.Target.Digest
 
-	logger := log.G(ctx).WithFields(logrus.Fields{
+	logger := log.G(ctx).WithFields(log.Fields{
 		"name":   rawImg.Name,
 		"digest": target,
 	})
@@ -199,14 +252,21 @@ func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore con
 			repoTags = append(repoTags, rawImg.Name)
 		}
 	} else {
-		repoTags = append(repoTags, reference.TagNameOnly(ref).String())
-
 		digested, err := reference.WithDigest(reference.TrimNamed(ref), target)
 		if err != nil {
 			logger.WithError(err).Error("failed to create digested reference")
 		} else {
 			repoDigests = append(repoDigests, digested.String())
 		}
+	}
+
+	cfgDesc, err := image.Image.Config(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var cfg configLabels
+	if err := readConfig(ctx, contentStore, cfgDesc, &cfg); err != nil {
+		return nil, nil, err
 	}
 
 	summary := &types.ImageSummary{
@@ -216,6 +276,7 @@ func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore con
 		RepoDigests: repoDigests,
 		RepoTags:    repoTags,
 		Size:        totalSize,
+		Labels:      cfg.Config.Labels,
 		// -1 indicates that the value has not been set (avoids ambiguity
 		// between 0 (default) and "not set". We cannot use a pointer (nil)
 		// for this, as the JSON representation uses "omitempty", which would
@@ -224,54 +285,55 @@ func (i *ImageService) singlePlatformImage(ctx context.Context, contentStore con
 		Containers: -1,
 	}
 
-	return summary, chainIDs, nil
+	return summary, identity.ChainIDs(diffIDs), nil
 }
 
 type imageFilterFunc func(image images.Image) bool
 
 // setupFilters constructs an imageFilterFunc from the given imageFilters.
 //
-// containerdListFilters is a slice of filters which should be passed to ImageService.List()
 // filterFunc is a function that checks whether given image matches the filters.
-// TODO(thaJeztah): reimplement filters using containerd filters: see https://github.com/moby/moby/issues/43845
-func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Args) (containerdListFilters []string, filterFunc imageFilterFunc, outErr error) {
+// TODO(thaJeztah): reimplement filters using containerd filters if possible: see https://github.com/moby/moby/issues/43845
+func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Args) (filterFunc imageFilterFunc, outErr error) {
 	var fltrs []imageFilterFunc
 	err := imageFilters.WalkValues("before", func(value string) error {
-		ref, err := reference.ParseDockerRef(value)
+		img, err := i.GetImage(ctx, value, image.GetImageOpts{})
 		if err != nil {
 			return err
 		}
-		img, err := i.client.GetImage(ctx, ref.String())
-		if img != nil {
-			t := img.Metadata().CreatedAt
-			fltrs = append(fltrs, func(image images.Image) bool {
-				created := image.CreatedAt
-				return created.Equal(t) || created.After(t)
+		if img != nil && img.Created != nil {
+			fltrs = append(fltrs, func(candidate images.Image) bool {
+				cand, err := i.GetImage(ctx, candidate.Name, image.GetImageOpts{})
+				if err != nil {
+					return false
+				}
+				return cand.Created != nil && cand.Created.Before(*img.Created)
 			})
 		}
-		return err
+		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	err = imageFilters.WalkValues("since", func(value string) error {
-		ref, err := reference.ParseDockerRef(value)
+		img, err := i.GetImage(ctx, value, image.GetImageOpts{})
 		if err != nil {
 			return err
 		}
-		img, err := i.client.GetImage(ctx, ref.String())
-		if img != nil {
-			t := img.Metadata().CreatedAt
-			fltrs = append(fltrs, func(image images.Image) bool {
-				created := image.CreatedAt
-				return created.Equal(t) || created.Before(t)
+		if img != nil && img.Created != nil {
+			fltrs = append(fltrs, func(candidate images.Image) bool {
+				cand, err := i.GetImage(ctx, candidate.Name, image.GetImageOpts{})
+				if err != nil {
+					return false
+				}
+				return cand.Created != nil && cand.Created.After(*img.Created)
 			})
 		}
-		return err
+		return nil
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	err = imageFilters.WalkValues("until", func(value string) error {
@@ -292,12 +354,12 @@ func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Ar
 		return err
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	labelFn, err := setupLabelFilter(i.client.ContentStore(), imageFilters)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if labelFn != nil {
 		fltrs = append(fltrs, labelFn)
@@ -306,28 +368,33 @@ func (i *ImageService) setupFilters(ctx context.Context, imageFilters filters.Ar
 	if imageFilters.Contains("dangling") {
 		danglingValue, err := imageFilters.GetBoolOrDefault("dangling", false)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		fltrs = append(fltrs, func(image images.Image) bool {
 			return danglingValue == isDanglingImage(image)
 		})
 	}
 
-	var listFilters []string
-	err = imageFilters.WalkValues("reference", func(value string) error {
-		ref, err := reference.ParseNormalizedNamed(value)
-		if err != nil {
-			return err
-		}
-		ref = reference.TagNameOnly(ref)
-		listFilters = append(listFilters, "name=="+ref.String())
-		return nil
-	})
-	if err != nil {
-		return nil, nil, err
+	if refs := imageFilters.Get("reference"); len(refs) != 0 {
+		fltrs = append(fltrs, func(image images.Image) bool {
+			ref, err := reference.ParseNormalizedNamed(image.Name)
+			if err != nil {
+				return false
+			}
+			for _, value := range refs {
+				found, err := reference.FamiliarMatch(value, ref)
+				if err != nil {
+					return false
+				}
+				if found {
+					return found
+				}
+			}
+			return false
+		})
 	}
 
-	return listFilters, func(image images.Image) bool {
+	return func(image images.Image) bool {
 		for _, filter := range fltrs {
 			if !filter(image) {
 				return false
@@ -385,12 +452,7 @@ func setupLabelFilter(store content.Store, fltrs filters.Args) (func(image image
 			if !images.IsConfigType(desc.MediaType) {
 				return nil, nil
 			}
-			// Subset of ocispec.Image that only contains Labels
-			var cfg struct {
-				Config struct {
-					Labels map[string]string `json:"Labels,omitempty"`
-				} `json:"Config,omitempty"`
-			}
+			var cfg configLabels
 			if err := readConfig(ctx, store, desc, &cfg); err != nil {
 				return nil, err
 			}
@@ -432,29 +494,15 @@ func setupLabelFilter(store content.Store, fltrs filters.Args) (func(image image
 			return true
 		}
 		if err != nil {
-			log.G(ctx).WithFields(logrus.Fields{
-				logrus.ErrorKey: err,
-				"image":         image.Name,
-				"checks":        checks,
+			log.G(ctx).WithFields(log.Fields{
+				"error":  err,
+				"image":  image.Name,
+				"checks": checks,
 			}).Error("failed to check image labels")
 		}
 
 		return false
 	}, nil
-}
-
-// computeSnapshotSize calculates the total size consumed by the snapshots
-// for the given chainIDs.
-func computeSnapshotSize(chainIDs []digest.Digest, sizeFn func(d digest.Digest) (int64, error)) (int64, error) {
-	var totalSize int64
-	for _, chainID := range chainIDs {
-		size, err := sizeFn(chainID)
-		if err != nil {
-			return totalSize, err
-		}
-		totalSize += size
-	}
-	return totalSize, nil
 }
 
 func computeSharedSize(chainIDs []digest.Digest, layers map[digest.Digest]int, sizeFn func(d digest.Digest) (int64, error)) (int64, error) {
@@ -476,11 +524,20 @@ func computeSharedSize(chainIDs []digest.Digest, layers map[digest.Digest]int, s
 func readConfig(ctx context.Context, store content.Provider, desc ocispec.Descriptor, out interface{}) error {
 	data, err := content.ReadBlob(ctx, store, desc)
 	if err != nil {
-		return errors.Wrapf(err, "failed to read config content")
+		err = errors.Wrapf(err, "failed to read config content")
+		if cerrdefs.IsNotFound(err) {
+			return errdefs.NotFound(err)
+		}
+		return err
 	}
+
 	err = json.Unmarshal(data, out)
 	if err != nil {
-		return errors.Wrapf(err, "could not deserialize image config")
+		err = errors.Wrapf(err, "could not deserialize image config")
+		if cerrdefs.IsNotFound(err) {
+			return errdefs.NotFound(err)
+		}
+		return err
 	}
 
 	return nil

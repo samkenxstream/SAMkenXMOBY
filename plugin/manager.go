@@ -17,6 +17,7 @@ import (
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/pkg/authorization"
 	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/ioutils"
@@ -56,7 +57,7 @@ func (pm *Manager) restorePlugin(p *v2.Plugin, c *controller) error {
 	return nil
 }
 
-type eventLogger func(id, name, action string)
+type eventLogger func(id, name string, action events.Action)
 
 // ManagerConfig defines configuration needed to start new manager.
 type ManagerConfig struct {
@@ -306,19 +307,27 @@ func (pm *Manager) GC() {
 
 type logHook struct{ id string }
 
-func (logHook) Levels() []logrus.Level {
-	return logrus.AllLevels
+func (logHook) Levels() []log.Level {
+	return []log.Level{
+		log.PanicLevel,
+		log.FatalLevel,
+		log.ErrorLevel,
+		log.WarnLevel,
+		log.InfoLevel,
+		log.DebugLevel,
+		log.TraceLevel,
+	}
 }
 
-func (l logHook) Fire(entry *logrus.Entry) error {
-	entry.Data = logrus.Fields{"plugin": l.id}
+func (l logHook) Fire(entry *log.Entry) error {
+	entry.Data = log.Fields{"plugin": l.id}
 	return nil
 }
 
 func makeLoggerStreams(id string) (stdout, stderr io.WriteCloser) {
 	logger := logrus.New()
 	logger.Hooks.Add(logHook{id})
-	return logger.WriterLevel(logrus.InfoLevel), logger.WriterLevel(logrus.ErrorLevel)
+	return logger.WriterLevel(log.InfoLevel), logger.WriterLevel(log.ErrorLevel)
 }
 
 func validatePrivileges(requiredPrivileges, privileges types.PluginPrivileges) error {

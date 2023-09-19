@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package macvlan
 
@@ -13,6 +12,7 @@ import (
 	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/discoverapi"
 	"github.com/docker/docker/libnetwork/netlabel"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/libnetwork/types"
 )
 
@@ -49,7 +49,7 @@ func (d *driver) initStore(option map[string]interface{}) error {
 		if !ok {
 			return types.InternalErrorf("incorrect data in datastore configuration: %v", data)
 		}
-		d.store, err = datastore.NewDataStoreFromConfig(dsc)
+		d.store, err = datastore.FromConfig(dsc)
 		if err != nil {
 			return types.InternalErrorf("macvlan driver failed to initialize data store: %v", err)
 		}
@@ -253,7 +253,7 @@ func (config *configuration) CopyTo(o datastore.KVObject) error {
 }
 
 func (config *configuration) DataScope() string {
-	return datastore.LocalScope
+	return scope.Local
 }
 
 func (ep *endpoint) MarshalJSON() ([]byte, error) {
@@ -353,5 +353,5 @@ func (ep *endpoint) CopyTo(o datastore.KVObject) error {
 }
 
 func (ep *endpoint) DataScope() string {
-	return datastore.LocalScope
+	return scope.Local
 }

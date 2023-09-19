@@ -352,6 +352,16 @@ func programSA(localIP, remoteIP net.IP, spi *spi, k *key, dir int, add bool) (f
 	return
 }
 
+// getMinimalIP returns the address in its shortest form
+// If ip contains an IPv4-mapped IPv6 address, the 4-octet form of the IPv4 address will be returned.
+// Otherwise ip is returned unchanged.
+func getMinimalIP(ip net.IP) net.IP {
+	if ip != nil && ip.To4() != nil {
+		return ip.To4()
+	}
+	return ip
+}
+
 func programSP(fSA *netlink.XfrmState, rSA *netlink.XfrmState, add bool) error {
 	action := "Removing"
 	xfrmProgram := ns.NlHandle().XfrmPolicyDel
@@ -361,8 +371,8 @@ func programSP(fSA *netlink.XfrmState, rSA *netlink.XfrmState, add bool) error {
 	}
 
 	// Create a congruent cidr
-	s := types.GetMinimalIP(fSA.Src)
-	d := types.GetMinimalIP(fSA.Dst)
+	s := getMinimalIP(fSA.Src)
+	d := getMinimalIP(fSA.Dst)
 	fullMask := net.CIDRMask(8*len(s), 8*len(s))
 
 	fPol := &netlink.XfrmPolicy{
@@ -509,12 +519,12 @@ func (d *driver) updateKeys(newKey, primary, pruneKey *key) error {
 	if (newKey != nil && newIdx == -1) ||
 		(primary != nil && priIdx == -1) ||
 		(pruneKey != nil && delIdx == -1) {
-		return types.BadRequestErrorf("cannot find proper key indices while processing key update:"+
+		return types.InvalidParameterErrorf("cannot find proper key indices while processing key update:"+
 			"(newIdx,priIdx,delIdx):(%d, %d, %d)", newIdx, priIdx, delIdx)
 	}
 
 	if priIdx != -1 && priIdx == delIdx {
-		return types.BadRequestErrorf("attempting to both make a key (index %d) primary and delete it", priIdx)
+		return types.InvalidParameterErrorf("attempting to both make a key (index %d) primary and delete it", priIdx)
 	}
 
 	d.secMapWalk(func(rIPs string, spis []*spi) ([]*spi, bool) {
@@ -575,8 +585,8 @@ func updateNodeKey(lIP, aIP, rIP net.IP, idxs []*spi, curKeys []*key, newIdx, pr
 		fSA2, _, _ := programSA(lIP, rIP, spis[priIdx], curKeys[priIdx], forward, true)
 
 		// +fSP2, -fSP1
-		s := types.GetMinimalIP(fSA2.Src)
-		d := types.GetMinimalIP(fSA2.Dst)
+		s := getMinimalIP(fSA2.Src)
+		d := getMinimalIP(fSA2.Dst)
 		fullMask := net.CIDRMask(8*len(s), 8*len(s))
 
 		fSP1 := &netlink.XfrmPolicy{

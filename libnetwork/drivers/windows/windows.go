@@ -23,10 +23,10 @@ import (
 	"github.com/Microsoft/hcsshim"
 	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/libnetwork/datastore"
-	"github.com/docker/docker/libnetwork/discoverapi"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/portmapper"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/libnetwork/types"
 )
 
@@ -101,7 +101,7 @@ type hnsNetwork struct {
 type driver struct {
 	name     string
 	networks map[string]*hnsNetwork
-	store    datastore.DataStore
+	store    *datastore.Store
 	sync.Mutex
 }
 
@@ -140,8 +140,8 @@ func RegisterBuiltinLocalDrivers(r driverapi.Registerer, driverConfig func(strin
 		}
 
 		err = r.RegisterDriver(networkType, d, driverapi.Capability{
-			DataScope:         datastore.LocalScope,
-			ConnectivityScope: datastore.LocalScope,
+			DataScope:         scope.Local,
+			ConnectivityScope: scope.Local,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to register %q driver: %w", networkType, err)
@@ -199,7 +199,7 @@ func (d *driver) parseNetworkOptions(id string, genericOptions map[string]string
 			config.MacPools = make([]hcsshim.MacPool, 0)
 			s := strings.Split(value, ",")
 			if len(s)%2 != 0 {
-				return nil, types.BadRequestErrorf("Invalid mac pool. You must specify both a start range and an end range")
+				return nil, types.InvalidParameterErrorf("invalid mac pool. You must specify both a start range and an end range")
 			}
 			for i := 0; i < len(s)-1; i += 2 {
 				config.MacPools = append(config.MacPools, hcsshim.MacPool{
@@ -242,7 +242,7 @@ func (c *networkConfiguration) processIPAM(id string, ipamV4Data, ipamV6Data []d
 	}
 
 	if len(ipamV4Data) == 0 {
-		return types.BadRequestErrorf("network %s requires ipv4 configuration", id)
+		return types.InvalidParameterErrorf("network %s requires ipv4 configuration", id)
 	}
 
 	return nil
@@ -261,7 +261,7 @@ func (d *driver) createNetwork(config *networkConfiguration) *hnsNetwork {
 		endpoints:  make(map[string]*hnsEndpoint),
 		config:     config,
 		driver:     d,
-		portMapper: portmapper.New(""),
+		portMapper: portmapper.New(),
 	}
 
 	d.Lock()
@@ -903,14 +903,4 @@ func (d *driver) Type() string {
 
 func (d *driver) IsBuiltIn() bool {
 	return true
-}
-
-// DiscoverNew is a notification for a new discovery event, such as a new node joining a cluster
-func (d *driver) DiscoverNew(dType discoverapi.DiscoveryType, data interface{}) error {
-	return nil
-}
-
-// DiscoverDelete is a notification for a discovery delete event, such as a node leaving a cluster
-func (d *driver) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{}) error {
-	return nil
 }

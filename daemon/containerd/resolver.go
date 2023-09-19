@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 
+	cerrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
@@ -14,7 +15,6 @@ import (
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/pkg/useragent"
 	"github.com/docker/docker/registry"
-	"github.com/sirupsen/logrus"
 )
 
 func (i *ImageService) newResolverFromAuthConfig(ctx context.Context, authConfig *registrytypes.AuthConfig) (remotes.Resolver, docker.StatusTracker) {
@@ -34,7 +34,7 @@ func (i *ImageService) newResolverFromAuthConfig(ctx context.Context, authConfig
 func hostsWrapper(hostsFn docker.RegistryHosts, optAuthConfig *registrytypes.AuthConfig, regService RegistryConfigProvider) docker.RegistryHosts {
 	var authorizer docker.Authorizer
 	if optAuthConfig != nil {
-		authorizer = docker.NewDockerAuthorizer(authorizationCredsFromAuthConfig(*optAuthConfig))
+		authorizer = authorizerFromAuthConfig(*optAuthConfig)
 	}
 
 	return func(n string) ([]docker.RegistryHost, error) {
@@ -56,15 +56,22 @@ func hostsWrapper(hostsFn docker.RegistryHosts, optAuthConfig *registrytypes.Aut
 	}
 }
 
-func authorizationCredsFromAuthConfig(authConfig registrytypes.AuthConfig) docker.AuthorizerOpt {
+func authorizerFromAuthConfig(authConfig registrytypes.AuthConfig) docker.Authorizer {
 	cfgHost := registry.ConvertToHostname(authConfig.ServerAddress)
 	if cfgHost == "" || cfgHost == registry.IndexHostname {
 		cfgHost = registry.DefaultRegistryHost
 	}
 
-	return docker.WithAuthCreds(func(host string) (string, string, error) {
+	if authConfig.RegistryToken != "" {
+		return &bearerAuthorizer{
+			host:   cfgHost,
+			bearer: authConfig.RegistryToken,
+		}
+	}
+
+	return docker.NewDockerAuthorizer(docker.WithAuthCreds(func(host string) (string, string, error) {
 		if cfgHost != host {
-			log.G(context.TODO()).WithFields(logrus.Fields{
+			log.G(context.TODO()).WithFields(log.Fields{
 				"host":    host,
 				"cfgHost": cfgHost,
 			}).Warn("Host doesn't match")
@@ -74,7 +81,31 @@ func authorizationCredsFromAuthConfig(authConfig registrytypes.AuthConfig) docke
 			return "", authConfig.IdentityToken, nil
 		}
 		return authConfig.Username, authConfig.Password, nil
-	})
+	}))
+}
+
+type bearerAuthorizer struct {
+	host   string
+	bearer string
+}
+
+func (a *bearerAuthorizer) Authorize(ctx context.Context, req *http.Request) error {
+	if req.Host != a.host {
+		log.G(ctx).WithFields(log.Fields{
+			"host":    req.Host,
+			"cfgHost": a.host,
+		}).Warn("Host doesn't match for bearer token")
+		return nil
+	}
+
+	req.Header.Set("Authorization", "Bearer "+a.bearer)
+
+	return nil
+}
+
+func (a *bearerAuthorizer) AddResponses(context.Context, []*http.Response) error {
+	// Return not implemented to prevent retry of the request when bearer did not succeed
+	return cerrdefs.ErrNotImplemented
 }
 
 type httpFallback struct {

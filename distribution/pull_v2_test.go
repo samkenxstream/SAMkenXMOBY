@@ -14,8 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/distribution/reference"
 	"github.com/docker/distribution/manifest/schema1"
-	"github.com/docker/distribution/reference"
 	registrytypes "github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/registry"
@@ -331,7 +331,6 @@ func testNewPuller(t *testing.T, rawurl string) *puller {
 	endpoint := registry.APIEndpoint{
 		Mirror:       false,
 		URL:          uri,
-		Version:      2,
 		Official:     false,
 		TrimHostname: false,
 		TLSConfig:    nil,

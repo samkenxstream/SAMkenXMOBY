@@ -1,7 +1,6 @@
 package container // import "github.com/docker/docker/integration/container"
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -19,9 +18,8 @@ import (
 func TestInspectCpusetInConfigPre120(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows" || !testEnv.DaemonInfo.CPUSet)
 
-	defer setupTest(t)()
-	client := request.NewAPIClient(t, client.WithVersion("1.19"))
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := request.NewAPIClient(t, client.WithVersion("1.19"))
 
 	name := strings.ToLower(t.Name())
 	// Create container with up to-date-API
@@ -31,9 +29,9 @@ func TestInspectCpusetInConfigPre120(t *testing.T) {
 			c.HostConfig.Resources.CpusetCpus = "0"
 		},
 	)
-	poll.WaitOn(t, container.IsInState(ctx, client, name, "exited"), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsInState(ctx, apiClient, name, "exited"), poll.WithDelay(100*time.Millisecond))
 
-	_, body, err := client.ContainerInspectWithRaw(ctx, name, false)
+	_, body, err := apiClient.ContainerInspectWithRaw(ctx, name, false)
 	assert.NilError(t, err)
 
 	var inspectJSON map[string]interface{}
@@ -49,9 +47,8 @@ func TestInspectCpusetInConfigPre120(t *testing.T) {
 }
 
 func TestInspectAnnotations(t *testing.T) {
-	defer setupTest(t)()
-	client := request.NewAPIClient(t)
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := request.NewAPIClient(t)
 
 	annotations := map[string]string{
 		"hello": "world",
@@ -59,7 +56,7 @@ func TestInspectAnnotations(t *testing.T) {
 	}
 
 	name := strings.ToLower(t.Name())
-	id := container.Create(ctx, t, client,
+	id := container.Create(ctx, t, apiClient,
 		container.WithName(name),
 		container.WithCmd("true"),
 		func(c *container.TestContainerConfig) {
@@ -67,7 +64,7 @@ func TestInspectAnnotations(t *testing.T) {
 		},
 	)
 
-	inspect, err := client.ContainerInspect(ctx, id)
+	inspect, err := apiClient.ContainerInspect(ctx, id)
 	assert.NilError(t, err)
 	assert.Check(t, is.DeepEqual(inspect.HostConfig.Annotations, annotations))
 }

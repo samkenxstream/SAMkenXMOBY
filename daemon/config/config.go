@@ -14,13 +14,11 @@ import (
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 
-	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
 	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/registry"
 	"github.com/imdario/mergo"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 )
 
@@ -288,7 +286,6 @@ func New() (*Config, error) {
 			ContainerdNamespace:       DefaultContainersNamespace,
 			ContainerdPluginNamespace: DefaultPluginNamespace,
 			DefaultRuntime:            StockRuntimeName,
-			CDISpecDirs:               append([]string(nil), cdi.DefaultSpecDirs...),
 		},
 	}
 
@@ -588,14 +585,19 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 func Validate(config *Config) error {
 	// validate log-level
 	if config.LogLevel != "" {
-		if _, err := logrus.ParseLevel(config.LogLevel); err != nil {
+		// FIXME(thaJeztah): find a better way for this; this depends on knowledge of containerd's log package internals.
+		// Alternatively: try  log.SetLevel(config.LogLevel), and restore the original level, but this also requires internal knowledge.
+		switch strings.ToLower(config.LogLevel) {
+		case "panic", "fatal", "error", "warn", "info", "debug", "trace":
+			// These are valid. See [log.SetLevel] for a list of accepted levels.
+		default:
 			return errors.Errorf("invalid logging level: %s", config.LogLevel)
 		}
 	}
 
 	// validate log-format
 	if logFormat := config.LogFormat; logFormat != "" {
-		switch logFormat {
+		switch log.OutputFormat(logFormat) {
 		case log.TextFormat, log.JSONFormat:
 			// These are valid
 		default:

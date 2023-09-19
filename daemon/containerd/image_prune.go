@@ -7,7 +7,7 @@ import (
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/log"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/errdefs"
@@ -15,7 +15,6 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 var imagesAcceptedFilters = map[string]bool{
@@ -53,7 +52,7 @@ func (i *ImageService) ImagesPrune(ctx context.Context, fltrs filters.Args) (*ty
 		fltrs.Del("dangling", v)
 	}
 
-	_, filterFunc, err := i.setupFilters(ctx, fltrs)
+	filterFunc, err := i.setupFilters(ctx, fltrs)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +79,7 @@ func (i *ImageService) pruneUnused(ctx context.Context, filterFunc imageFilterFu
 
 		if !danglingOnly || isDanglingImage(img) {
 			canBePruned := filterFunc(img)
-			log.G(ctx).WithFields(logrus.Fields{
+			log.G(ctx).WithFields(log.Fields{
 				"image":       img.Name,
 				"canBePruned": canBePruned,
 			}).Debug("considering image for pruning")
@@ -116,7 +115,7 @@ func (i *ImageService) pruneUnused(ctx context.Context, filterFunc imageFilterFu
 		}
 
 		ref, err := reference.ParseNormalizedNamed(ctr.Config.Image)
-		log.G(ctx).WithFields(logrus.Fields{
+		log.G(ctx).WithFields(log.Fields{
 			"ctr":          ctr.ID,
 			"image":        ref,
 			"nameParseErr": err,

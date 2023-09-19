@@ -6,13 +6,15 @@ import (
 	"io"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/content"
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	containerdimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/images/archive"
+	"github.com/containerd/containerd/leases"
 	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/mount"
 	cplatforms "github.com/containerd/containerd/platforms"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/platforms"
@@ -20,7 +22,6 @@ import (
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 func (i *ImageService) PerformWithBaseFS(ctx context.Context, c *container.Container, fn func(root string) error) error {
@@ -29,7 +30,13 @@ func (i *ImageService) PerformWithBaseFS(ctx context.Context, c *container.Conta
 	if err != nil {
 		return err
 	}
-	return mount.WithTempMount(ctx, mounts, fn)
+	path, err := i.refCountMounter.Mount(mounts, c.ID)
+	if err != nil {
+		return err
+	}
+	defer i.refCountMounter.Unmount(path)
+
+	return fn(path)
 }
 
 // ExportImage exports a list of images to the given output stream. The
@@ -58,15 +65,25 @@ func (i *ImageService) ExportImage(ctx context.Context, names []string, outStrea
 		archive.WithPlatform(platform),
 	}
 
-	ctx, release, err := i.client.WithLease(ctx)
+	contentStore := i.client.ContentStore()
+	leasesManager := i.client.LeasesService()
+	lease, err := leasesManager.Create(ctx, leases.WithRandomID())
 	if err != nil {
 		return errdefs.System(err)
 	}
-	defer release(ctx)
+	defer func() {
+		if err := leasesManager.Delete(ctx, lease); err != nil {
+			log.G(ctx).WithError(err).Warn("cleaning up lease")
+		}
+	}()
 
 	for _, name := range names {
 		target, err := i.resolveDescriptor(ctx, name)
 		if err != nil {
+			return err
+		}
+
+		if err = leaseContent(ctx, contentStore, leasesManager, lease, target); err != nil {
 			return err
 		}
 
@@ -85,20 +102,46 @@ func (i *ImageService) ExportImage(ctx context.Context, names []string, outStrea
 			ref = reference.TagNameOnly(ref)
 			opts = append(opts, archive.WithManifest(target, ref.String()))
 
-			log.G(ctx).WithFields(logrus.Fields{
+			log.G(ctx).WithFields(log.Fields{
 				"target": target,
 				"name":   ref.String(),
 			}).Debug("export image")
 		} else {
 			opts = append(opts, archive.WithManifest(target))
 
-			log.G(ctx).WithFields(logrus.Fields{
+			log.G(ctx).WithFields(log.Fields{
 				"target": target,
 			}).Debug("export image without name")
 		}
+
+		i.LogImageEvent(target.Digest.String(), target.Digest.String(), events.ActionSave)
 	}
 
 	return i.client.Export(ctx, outStream, opts...)
+}
+
+// leaseContent will add a resource to the lease for each child of the descriptor making sure that it and
+// its children won't be deleted while the lease exists
+func leaseContent(ctx context.Context, store content.Store, leasesManager leases.Manager, lease leases.Lease, desc ocispec.Descriptor) error {
+	return containerdimages.Walk(ctx, containerdimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		_, err := store.Info(ctx, desc.Digest)
+		if err != nil {
+			if errors.Is(err, cerrdefs.ErrNotFound) {
+				return nil, nil
+			}
+			return nil, errdefs.System(err)
+		}
+
+		r := leases.Resource{
+			ID:   desc.Digest.String(),
+			Type: "content",
+		}
+		if err := leasesManager.AddResource(ctx, lease, r); err != nil {
+			return nil, errdefs.System(err)
+		}
+
+		return containerdimages.Children(ctx, store, desc)
+	}), desc)
 }
 
 // LoadImage uploads a set of images into the repository. This is the
@@ -111,7 +154,7 @@ func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, outSt
 
 		// Create an additional image with dangling name for imported images...
 		containerd.WithDigestRef(danglingImageName),
-		/// ... but only if they don't have a name or it's invalid.
+		// ... but only if they don't have a name or it's invalid.
 		containerd.WithSkipDigestRef(func(nameFromArchive string) bool {
 			if nameFromArchive == "" {
 				return false
@@ -141,7 +184,7 @@ func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, outSt
 		}
 
 		err = i.walkImageManifests(ctx, img, func(platformImg *ImageManifest) error {
-			logger := log.G(ctx).WithFields(logrus.Fields{
+			logger := log.G(ctx).WithFields(log.Fields{
 				"image":    name,
 				"manifest": platformImg.Target().Digest,
 			})
@@ -176,7 +219,7 @@ func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, outSt
 		}
 
 		fmt.Fprintf(progress, "%s: %s\n", loadedMsg, name)
-		i.LogImageEvent(img.Target.Digest.String(), img.Target.Digest.String(), "load")
+		i.LogImageEvent(img.Target.Digest.String(), img.Target.Digest.String(), events.ActionLoad)
 	}
 
 	return nil
@@ -223,7 +266,7 @@ func (i *ImageService) getBestDescriptorForExport(ctx context.Context, indexDesc
 				log.G(ctx).WithField("manifest", mfst.Digest).Debug("manifest content present, will export")
 			} else {
 				hasMissingManifests = true
-				log.G(ctx).WithFields(logrus.Fields{
+				log.G(ctx).WithFields(log.Fields{
 					"manifest": mfst.Digest,
 					"missing":  missing,
 				}).Debug("manifest is missing, won't export")

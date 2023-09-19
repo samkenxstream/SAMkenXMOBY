@@ -28,15 +28,13 @@ func executeInCompartment(compartmentID uint32, x func()) {
 	x()
 }
 
-func (n *network) startResolver() {
+func (n *Network) startResolver() {
 	if n.networkType == "ics" {
 		return
 	}
 	n.resolverOnce.Do(func() {
 		log.G(context.TODO()).Debugf("Launching DNS server for network %q", n.Name())
-		options := n.Info().DriverOptions()
-		hnsid := options[windows.HNSID]
-
+		hnsid := n.DriverOptions()[windows.HNSID]
 		if hnsid == "" {
 			return
 		}

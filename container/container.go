@@ -17,6 +17,7 @@ import (
 	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/log"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	mounttypes "github.com/docker/docker/api/types/mount"
 	swarmtypes "github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/container/stream"
@@ -175,7 +176,7 @@ func (container *Container) toDisk() (*Container, error) {
 	}
 
 	// Save container settings
-	f, err := ioutils.NewAtomicFileWriter(pth, 0600)
+	f, err := ioutils.NewAtomicFileWriter(pth, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +251,7 @@ func (container *Container) WriteHostConfig() (*containertypes.HostConfig, error
 		return nil, err
 	}
 
-	f, err := ioutils.NewAtomicFileWriter(pth, 0600)
+	f, err := ioutils.NewAtomicFileWriter(pth, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +280,7 @@ func (container *Container) SetupWorkingDirectory(rootIdentity idtools.Identity)
 		return err
 	}
 
-	if err := idtools.MkdirAllAndChownNew(pth, 0755, rootIdentity); err != nil {
+	if err := idtools.MkdirAllAndChownNew(pth, 0o755, rootIdentity); err != nil {
 		pthInfo, err2 := os.Stat(pth)
 		if err2 == nil && pthInfo != nil && !pthInfo.IsDir() {
 			return errors.Errorf("Cannot mkdir: %s is not a directory", container.Config.WorkingDir)
@@ -402,7 +403,7 @@ func (container *Container) StartLogger() (logger.Logger, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := os.MkdirAll(logDir, 0700); err != nil {
+		if err := os.MkdirAll(logDir, 0o700); err != nil {
 			return nil, errdefs.System(errors.Wrap(err, "error creating local logs dir"))
 		}
 		info.LogPath = filepath.Join(logDir, "container.log")
@@ -488,26 +489,24 @@ func (container *Container) AddMountPointWithVolume(destination string, vol volu
 }
 
 // UnmountVolumes unmounts all volumes
-func (container *Container) UnmountVolumes(volumeEventLog func(name, action string, attributes map[string]string)) error {
-	var errors []string
+func (container *Container) UnmountVolumes(volumeEventLog func(name string, action events.Action, attributes map[string]string)) error {
+	var errs []string
 	for _, volumeMount := range container.MountPoints {
 		if volumeMount.Volume == nil {
 			continue
 		}
 
 		if err := volumeMount.Cleanup(); err != nil {
-			errors = append(errors, err.Error())
+			errs = append(errs, err.Error())
 			continue
 		}
-
-		attributes := map[string]string{
+		volumeEventLog(volumeMount.Volume.Name(), events.ActionUnmount, map[string]string{
 			"driver":    volumeMount.Volume.DriverName(),
 			"container": container.ID,
-		}
-		volumeEventLog(volumeMount.Volume.Name(), "unmount", attributes)
+		})
 	}
-	if len(errors) > 0 {
-		return fmt.Errorf("error while unmounting volumes for container %s: %s", container.ID, strings.Join(errors, "; "))
+	if len(errs) > 0 {
+		return fmt.Errorf("error while unmounting volumes for container %s: %s", container.ID, strings.Join(errs, "; "))
 	}
 	return nil
 }

@@ -2,8 +2,8 @@ package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net"
 	"runtime"
 	"strings"
 	"time"
@@ -12,6 +12,7 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	imagetypes "github.com/docker/docker/api/types/image"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/container"
@@ -19,11 +20,11 @@ import (
 	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
+	"github.com/docker/docker/internal/multierror"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/runconfig"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/selinux/go-selinux"
-	"github.com/pkg/errors"
 	archvariant "github.com/tonistiigi/go-archvariant"
 )
 
@@ -63,6 +64,16 @@ func (daemon *Daemon) containerCreate(ctx context.Context, daemonCfg *configStor
 		return containertypes.CreateResponse{}, errdefs.InvalidParameter(errors.New("Config cannot be empty in order to create a container"))
 	}
 
+	// Normalize some defaults. Doing this "ad-hoc" here for now, as there's
+	// only one field to migrate, but we should consider having a better
+	// location for this (and decide where in the flow would be most appropriate).
+	//
+	// TODO(thaJeztah): we should have a more visible, more canonical location for this.
+	if opts.params.HostConfig != nil && opts.params.HostConfig.RestartPolicy.Name == "" {
+		// Set the default restart-policy ("none") if no restart-policy was set.
+		opts.params.HostConfig.RestartPolicy.Name = containertypes.RestartPolicyDisabled
+	}
+
 	warnings, err := daemon.verifyContainerSettings(daemonCfg, opts.params.HostConfig, opts.params.Config, false)
 	if err != nil {
 		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
@@ -87,7 +98,7 @@ func (daemon *Daemon) containerCreate(ctx context.Context, daemonCfg *configStor
 		}
 	}
 
-	err = verifyNetworkingConfig(opts.params.NetworkingConfig)
+	err = daemon.validateNetworkingConfig(opts.params.NetworkingConfig)
 	if err != nil {
 		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
@@ -225,7 +236,7 @@ func (daemon *Daemon) create(ctx context.Context, daemonCfg *config.Config, opts
 		return nil, err
 	}
 	stateCtr.set(ctr.ID, "stopped")
-	daemon.LogContainerEvent(ctr, "create")
+	daemon.LogContainerEvent(ctr, events.ActionCreate)
 	return ctr, nil
 }
 
@@ -305,43 +316,35 @@ func (daemon *Daemon) mergeAndVerifyConfig(config *containertypes.Config, img *i
 		config.Entrypoint = nil
 	}
 	if len(config.Entrypoint) == 0 && len(config.Cmd) == 0 {
-		return fmt.Errorf("No command specified")
+		return fmt.Errorf("no command specified")
 	}
 	return nil
 }
 
-// Checks if the client set configurations for more than one network while creating a container
-// Also checks if the IPAMConfig is valid
-func verifyNetworkingConfig(nwConfig *networktypes.NetworkingConfig) error {
-	if nwConfig == nil || len(nwConfig.EndpointsConfig) == 0 {
+// validateNetworkingConfig checks whether a container's NetworkingConfig is valid.
+func (daemon *Daemon) validateNetworkingConfig(nwConfig *networktypes.NetworkingConfig) error {
+	if nwConfig == nil {
 		return nil
 	}
-	if len(nwConfig.EndpointsConfig) > 1 {
-		l := make([]string, 0, len(nwConfig.EndpointsConfig))
-		for k := range nwConfig.EndpointsConfig {
-			l = append(l, k)
-		}
-		return errors.Errorf("Container cannot be connected to network endpoints: %s", strings.Join(l, ", "))
-	}
 
+	var errs []error
 	for k, v := range nwConfig.EndpointsConfig {
 		if v == nil {
-			return errdefs.InvalidParameter(errors.Errorf("no EndpointSettings for %s", k))
+			errs = append(errs, fmt.Errorf("invalid config for network %s: EndpointsConfig is nil", k))
+			continue
 		}
-		if v.IPAMConfig != nil {
-			if v.IPAMConfig.IPv4Address != "" && net.ParseIP(v.IPAMConfig.IPv4Address).To4() == nil {
-				return errors.Errorf("invalid IPv4 address: %s", v.IPAMConfig.IPv4Address)
-			}
-			if v.IPAMConfig.IPv6Address != "" {
-				n := net.ParseIP(v.IPAMConfig.IPv6Address)
-				// if the address is an invalid network address (ParseIP == nil) or if it is
-				// an IPv4 address (To4() != nil), then it is an invalid IPv6 address
-				if n == nil || n.To4() != nil {
-					return errors.Errorf("invalid IPv6 address: %s", v.IPAMConfig.IPv6Address)
-				}
-			}
+
+		// The referenced network k might not exist when the container is created, so just ignore the error in that case.
+		nw, _ := daemon.FindNetwork(k)
+		if err := validateEndpointSettings(nw, k, v); err != nil {
+			errs = append(errs, fmt.Errorf("invalid config for network %s: %w", k, err))
 		}
 	}
+
+	if len(errs) > 0 {
+		return errdefs.InvalidParameter(multierror.Join(errs...))
+	}
+
 	return nil
 }
 

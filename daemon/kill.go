@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/log"
+	"github.com/docker/docker/api/types/events"
 	containerpkg "github.com/docker/docker/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/moby/sys/signal"
@@ -87,7 +88,12 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, stopSign
 
 	if !daemon.IsShuttingDown() {
 		container.HasBeenManuallyStopped = true
-		container.CheckpointTo(daemon.containersReplica)
+		if err := container.CheckpointTo(daemon.containersReplica); err != nil {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"error":     err,
+				"container": container.ID,
+			}).Warn("error checkpointing container state")
+		}
 	}
 
 	// if the container is currently restarting we do not need to send the signal
@@ -111,7 +117,13 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, stopSign
 				defer cancel()
 				s := <-container.Wait(ctx, containerpkg.WaitConditionNotRunning)
 				if s.Err() != nil {
-					daemon.handleContainerExit(container, nil)
+					if err := daemon.handleContainerExit(container, nil); err != nil {
+						log.G(context.TODO()).WithFields(log.Fields{
+							"error":     err,
+							"container": container.ID,
+							"action":    "kill",
+						}).Warn("error while handling container exit")
+					}
 				}
 			}()
 		} else {
@@ -126,7 +138,7 @@ func (daemon *Daemon) killWithSignal(container *containerpkg.Container, stopSign
 		}
 	}
 
-	daemon.LogContainerEventWithAttributes(container, "kill", map[string]string{
+	daemon.LogContainerEventWithAttributes(container, events.ActionKill, map[string]string{
 		"signal": strconv.Itoa(int(stopSignal)),
 	})
 	return nil

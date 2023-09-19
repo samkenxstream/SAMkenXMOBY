@@ -9,17 +9,13 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/sirupsen/logrus"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/defaults"
@@ -27,8 +23,8 @@ import (
 	"github.com/containerd/containerd/pkg/dialer"
 	"github.com/containerd/containerd/pkg/userns"
 	"github.com/containerd/containerd/remotes/docker"
+	"github.com/distribution/reference"
 	dist "github.com/docker/distribution"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	registrytypes "github.com/docker/docker/api/types/registry"
@@ -73,6 +69,7 @@ import (
 	"github.com/moby/locker"
 	"github.com/pkg/errors"
 	"go.etcd.io/bbolt"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
@@ -194,42 +191,25 @@ func (daemon *Daemon) UsesSnapshotter() bool {
 // RegistryHosts returns the registry hosts configuration for the host component
 // of a distribution image reference.
 func (daemon *Daemon) RegistryHosts(host string) ([]docker.RegistryHost, error) {
-	var (
-		conf        = daemon.config()
-		registryKey = "docker.io"
-		mirrors     = make([]string, len(conf.Mirrors))
-		m           = map[string]resolverconfig.RegistryConfig{}
-	)
-	// must trim "https://" or "http://" prefix
-	for i, v := range conf.Mirrors {
-		if uri, err := url.Parse(v); err == nil {
-			v = uri.Host
-		}
-		mirrors[i] = v
+	m := map[string]resolverconfig.RegistryConfig{
+		"docker.io": {Mirrors: daemon.registryService.ServiceConfig().Mirrors},
 	}
-	// set mirrors for default registry
-	m[registryKey] = resolverconfig.RegistryConfig{Mirrors: mirrors}
-
-	for _, v := range conf.InsecureRegistries {
-		u, err := url.Parse(v)
-		if err != nil && !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
-			originalErr := err
-			u, err = url.Parse("http://" + v)
-			if err != nil {
-				err = originalErr
-			}
-		}
+	conf := daemon.registryService.ServiceConfig().IndexConfigs
+	for k, v := range conf {
 		c := resolverconfig.RegistryConfig{}
-		if err == nil {
-			v = u.Host
+		if !v.Secure {
 			t := true
-			if u.Scheme == "http" {
-				c.PlainHTTP = &t
-			} else {
-				c.Insecure = &t
-			}
+			c.PlainHTTP = &t
+			c.Insecure = &t
 		}
-		m[v] = c
+		m[k] = c
+	}
+	if _, ok := m[host]; !ok && daemon.registryService.IsInsecureRegistry(host) {
+		c := resolverconfig.RegistryConfig{}
+		t := true
+		c.PlainHTTP = &t
+		c.Insecure = &t
+		m[host] = c
 	}
 
 	for k, v := range m {
@@ -285,27 +265,27 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 			_ = sem.Acquire(context.Background(), 1)
 			defer sem.Release(1)
 
-			log := log.G(context.TODO()).WithField("container", id)
+			logger := log.G(context.TODO()).WithField("container", id)
 
 			c, err := daemon.load(id)
 			if err != nil {
-				log.WithError(err).Error("failed to load container")
+				logger.WithError(err).Error("failed to load container")
 				return
 			}
 			if c.Driver != daemon.imageService.StorageDriver() {
 				// Ignore the container if it wasn't created with the current storage-driver
-				log.Debugf("not restoring container because it was created with another storage driver (%s)", c.Driver)
+				logger.Debugf("not restoring container because it was created with another storage driver (%s)", c.Driver)
 				return
 			}
 			if accessor, ok := daemon.imageService.(layerAccessor); ok {
 				rwlayer, err := accessor.GetLayerByID(c.ID)
 				if err != nil {
-					log.WithError(err).Error("failed to load container mount")
+					logger.WithError(err).Error("failed to load container mount")
 					return
 				}
 				c.RWLayer = rwlayer
 			}
-			log.WithFields(logrus.Fields{
+			logger.WithFields(log.Fields{
 				"running": c.IsRunning(),
 				"paused":  c.IsPaused(),
 			}).Debug("loaded container")
@@ -328,17 +308,17 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 			_ = sem.Acquire(context.Background(), 1)
 			defer sem.Release(1)
 
-			log := log.G(context.TODO()).WithField("container", c.ID)
+			logger := log.G(context.TODO()).WithField("container", c.ID)
 
 			if err := daemon.registerName(c); err != nil {
-				log.WithError(err).Errorf("failed to register container name: %s", c.Name)
+				logger.WithError(err).Errorf("failed to register container name: %s", c.Name)
 				mapLock.Lock()
 				delete(containers, c.ID)
 				mapLock.Unlock()
 				return
 			}
 			if err := daemon.Register(c); err != nil {
-				log.WithError(err).Error("failed to register container")
+				logger.WithError(err).Error("failed to register container")
 				mapLock.Lock()
 				delete(containers, c.ID)
 				mapLock.Unlock()
@@ -355,16 +335,29 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 			_ = sem.Acquire(context.Background(), 1)
 			defer sem.Release(1)
 
-			log := log.G(context.TODO()).WithField("container", c.ID)
+			baseLogger := log.G(context.TODO()).WithField("container", c.ID)
+
+			// Migrate containers that don't have the default ("no") restart-policy set.
+			// The RestartPolicy.Name field may be empty for containers that were
+			// created with versions before v25.0.0.
+			//
+			// We also need to set the MaximumRetryCount to 0, to prevent
+			// validation from failing (MaximumRetryCount is not allowed if
+			// no restart-policy ("none") is set).
+			if c.HostConfig != nil && c.HostConfig.RestartPolicy.Name == "" {
+				baseLogger.WithError(err).Debug("migrated restart-policy")
+				c.HostConfig.RestartPolicy.Name = containertypes.RestartPolicyDisabled
+				c.HostConfig.RestartPolicy.MaximumRetryCount = 0
+			}
 
 			if err := daemon.checkpointAndSave(c); err != nil {
-				log.WithError(err).Error("error saving backported mountspec to disk")
+				baseLogger.WithError(err).Error("failed to save migrated container config to disk")
 			}
 
 			daemon.setStateCounter(c)
 
-			logger := func(c *container.Container) *logrus.Entry {
-				return log.WithFields(logrus.Fields{
+			logger := func(c *container.Container) *log.Entry {
+				return baseLogger.WithFields(log.Fields{
 					"running":    c.IsRunning(),
 					"paused":     c.IsPaused(),
 					"restarting": c.IsRestarting(),
@@ -399,7 +392,7 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 					} else if !cfg.LiveRestoreEnabled {
 						logger(c).Debug("shutting down container considered alive by containerd")
 						if err := daemon.shutdownContainer(c); err != nil && !errdefs.IsNotFound(err) {
-							log.WithError(err).Error("error shutting down container")
+							baseLogger.WithError(err).Error("error shutting down container")
 							return
 						}
 						status = containerd.Stopped
@@ -423,7 +416,7 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 					case containerd.Paused, containerd.Pausing:
 						// nothing to do
 					case containerd.Unknown, containerd.Stopped, "":
-						log.WithField("status", status).Error("unexpected status for paused container during restore")
+						baseLogger.WithField("status", status).Error("unexpected status for paused container during restore")
 					default:
 						// running
 						c.Lock()
@@ -431,7 +424,7 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 						daemon.setStateCounter(c)
 						daemon.updateHealthMonitor(c)
 						if err := c.CheckpointTo(daemon.containersReplica); err != nil {
-							log.WithError(err).Error("failed to update paused container state")
+							baseLogger.WithError(err).Error("failed to update paused container state")
 						}
 						c.Unlock()
 					}
@@ -455,7 +448,7 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 					c.SetStopped(&ces)
 					daemon.Cleanup(c)
 					if err := c.CheckpointTo(daemon.containersReplica); err != nil {
-						log.WithError(err).Error("failed to update stopped container state")
+						baseLogger.WithError(err).Error("failed to update stopped container state")
 					}
 					c.Unlock()
 					logger(c).Debug("set stopped state")
@@ -519,9 +512,9 @@ func (daemon *Daemon) restore(cfg *configStore) error {
 				c.RemovalInProgress = false
 				c.Dead = true
 				if err := c.CheckpointTo(daemon.containersReplica); err != nil {
-					log.WithError(err).Error("failed to update RemovalInProgress container state")
+					baseLogger.WithError(err).Error("failed to update RemovalInProgress container state")
 				} else {
-					log.Debugf("reset RemovalInProgress state for container")
+					baseLogger.Debugf("reset RemovalInProgress state for container")
 				}
 			}
 			c.Unlock()
@@ -941,10 +934,17 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		// TODO(stevvooe): We may need to allow configuration of this on the client.
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+		grpc.WithUnaryInterceptor(otelgrpc.UnaryClientInterceptor()),
+		grpc.WithStreamInterceptor(otelgrpc.StreamClientInterceptor()),
 	}
 
 	if cfgStore.ContainerdAddr != "" {
-		d.containerdClient, err = containerd.New(cfgStore.ContainerdAddr, containerd.WithDefaultNamespace(cfgStore.ContainerdNamespace), containerd.WithDialOpts(gopts), containerd.WithTimeout(60*time.Second))
+		d.containerdClient, err = containerd.New(
+			cfgStore.ContainerdAddr,
+			containerd.WithDefaultNamespace(cfgStore.ContainerdNamespace),
+			containerd.WithDialOpts(gopts),
+			containerd.WithTimeout(60*time.Second),
+		)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to dial %q", cfgStore.ContainerdAddr)
 		}
@@ -954,7 +954,12 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		var pluginCli *containerd.Client
 
 		if cfgStore.ContainerdAddr != "" {
-			pluginCli, err = containerd.New(cfgStore.ContainerdAddr, containerd.WithDefaultNamespace(cfgStore.ContainerdPluginNamespace), containerd.WithDialOpts(gopts), containerd.WithTimeout(60*time.Second))
+			pluginCli, err = containerd.New(
+				cfgStore.ContainerdAddr,
+				containerd.WithDefaultNamespace(cfgStore.ContainerdPluginNamespace),
+				containerd.WithDialOpts(gopts),
+				containerd.WithTimeout(60*time.Second),
+			)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to dial %q", cfgStore.ContainerdAddr)
 			}
@@ -1011,7 +1016,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		return nil, errors.New("Devices cgroup isn't mounted")
 	}
 
-	d.id, err = loadOrCreateID(filepath.Join(cfgStore.Root, "engine-id"))
+	d.id, err = LoadOrCreateID(cfgStore.Root)
 	if err != nil {
 		return nil, err
 	}
@@ -1065,6 +1070,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 			RegistryHosts:   d.RegistryHosts,
 			Registry:        d.registryService,
 			EventsService:   d.EventsService,
+			IDMapping:       idMapping,
 			RefCountMounter: snapshotter.NewMounter(config.Root, driverName, idMapping),
 		})
 	} else {
@@ -1187,7 +1193,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 	engineCpus.Set(float64(info.NCPU))
 	engineMemory.Set(float64(info.MemTotal))
 
-	log.G(ctx).WithFields(logrus.Fields{
+	log.G(ctx).WithFields(log.Fields{
 		"version":     dockerversion.Version,
 		"commit":      dockerversion.GitCommit,
 		"graphdriver": d.ImageService().StorageDriver(),
@@ -1273,16 +1279,16 @@ func (daemon *Daemon) Shutdown(ctx context.Context) error {
 			if !c.IsRunning() {
 				return
 			}
-			log := log.G(ctx).WithField("container", c.ID)
-			log.Debug("shutting down container")
+			logger := log.G(ctx).WithField("container", c.ID)
+			logger.Debug("shutting down container")
 			if err := daemon.shutdownContainer(c); err != nil {
-				log.WithError(err).Error("failed to shut down container")
+				logger.WithError(err).Error("failed to shut down container")
 				return
 			}
 			if mountid, err := daemon.imageService.GetLayerMountID(c.ID); err == nil {
 				daemon.cleanupMountsByID(mountid)
 			}
-			log.Debugf("shut down container")
+			logger.Debugf("shut down container")
 		})
 	}
 
@@ -1340,10 +1346,8 @@ func (daemon *Daemon) Subnets() ([]net.IPNet, []net.IPNet) {
 	var v4Subnets []net.IPNet
 	var v6Subnets []net.IPNet
 
-	managedNetworks := daemon.netController.Networks()
-
-	for _, managedNetwork := range managedNetworks {
-		v4infos, v6infos := managedNetwork.Info().IpamInfo()
+	for _, managedNetwork := range daemon.netController.Networks() {
+		v4infos, v6infos := managedNetwork.IpamInfo()
 		for _, info := range v4infos {
 			if info.IPAMData.Pool != nil {
 				v4Subnets = append(v4Subnets, *info.IPAMData.Pool)

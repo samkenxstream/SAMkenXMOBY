@@ -12,6 +12,7 @@ import (
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	mounttypes "github.com/docker/docker/api/types/mount"
 	swarmtypes "github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/pkg/stringid"
@@ -60,7 +61,7 @@ func (container *Container) BuildHostnameFile() error {
 		return err
 	}
 	container.HostnamePath = hostnamePath
-	return os.WriteFile(container.HostnamePath, []byte(container.Config.Hostname+"\n"), 0644)
+	return os.WriteFile(container.HostnamePath, []byte(container.Config.Hostname+"\n"), 0o644)
 }
 
 // NetworkMounts returns the list of network mounts.
@@ -365,7 +366,7 @@ func (container *Container) UpdateContainer(hostConfig *containertypes.HostConfi
 // DetachAndUnmount uses a detached mount on all mount destinations, then
 // unmounts each volume normally.
 // This is used from daemon/archive for `docker cp`
-func (container *Container) DetachAndUnmount(volumeEventLog func(name, action string, attributes map[string]string)) error {
+func (container *Container) DetachAndUnmount(volumeEventLog func(name string, action events.Action, attributes map[string]string)) error {
 	ctx := context.TODO()
 
 	networkMounts := container.NetworkMounts()

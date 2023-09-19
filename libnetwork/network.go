@@ -20,69 +20,10 @@ import (
 	"github.com/docker/docker/libnetwork/netutils"
 	"github.com/docker/docker/libnetwork/networkdb"
 	"github.com/docker/docker/libnetwork/options"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/docker/docker/pkg/stringid"
 )
-
-// A Network represents a logical connectivity zone that containers may
-// join using the Link method. A Network is managed by a specific driver.
-type Network interface {
-	// Name returns a user chosen name for this network.
-	Name() string
-
-	// ID returns a system generated id for this network.
-	ID() string
-
-	// Type returns the type of network, which corresponds to its managing driver.
-	Type() string
-
-	// CreateEndpoint creates a new endpoint to this network symbolically identified by the
-	// specified unique name. The options parameter carries driver specific options.
-	CreateEndpoint(name string, options ...EndpointOption) (*Endpoint, error)
-
-	// Delete the network.
-	Delete(options ...NetworkDeleteOption) error
-
-	// Endpoints returns the list of Endpoint(s) in this network.
-	Endpoints() []*Endpoint
-
-	// WalkEndpoints uses the provided function to walk the Endpoints.
-	WalkEndpoints(walker EndpointWalker)
-
-	// EndpointByName returns the Endpoint which has the passed name. If not found, the error ErrNoSuchEndpoint is returned.
-	EndpointByName(name string) (*Endpoint, error)
-
-	// EndpointByID returns the Endpoint which has the passed id. If not found, the error ErrNoSuchEndpoint is returned.
-	EndpointByID(id string) (*Endpoint, error)
-
-	// Info returns certain operational data belonging to this network.
-	Info() NetworkInfo
-}
-
-// NetworkInfo returns some configuration and operational information about the network
-type NetworkInfo interface {
-	IpamConfig() (string, map[string]string, []*IpamConf, []*IpamConf)
-	IpamInfo() ([]*IpamInfo, []*IpamInfo)
-	DriverOptions() map[string]string
-	Scope() string
-	IPv6Enabled() bool
-	Internal() bool
-	Attachable() bool
-	Ingress() bool
-	ConfigFrom() string
-	ConfigOnly() bool
-	Labels() map[string]string
-	Dynamic() bool
-	Created() time.Time
-	// Peers returns a slice of PeerInfo structures which has the information about the peer
-	// nodes participating in the same overlay network. This is currently the per-network
-	// gossip cluster. For non-dynamic overlay networks and bridge networks it returns an
-	// empty slice
-	Peers() []networkdb.PeerInfo
-	// Services returns a map of services keyed by the service name with the details
-	// of all the tasks that belong to the service. Applicable only in swarm mode.
-	Services() map[string]ServiceInfo
-}
 
 // EndpointWalker is a client provided function which will be used to walk the Endpoints.
 // When the function returns true, the walk will stop.
@@ -130,6 +71,8 @@ type networkDBTable struct {
 }
 
 // IpamConf contains all the ipam related configurations for a network
+//
+// TODO(aker): use proper net/* structs instead of string literals.
 type IpamConf struct {
 	// PreferredPool is the master address pool for containers and network interfaces.
 	PreferredPool string
@@ -146,9 +89,31 @@ type IpamConf struct {
 // Validate checks whether the configuration is valid
 func (c *IpamConf) Validate() error {
 	if c.Gateway != "" && nil == net.ParseIP(c.Gateway) {
-		return types.BadRequestErrorf("invalid gateway address %s in Ipam configuration", c.Gateway)
+		return types.InvalidParameterErrorf("invalid gateway address %s in Ipam configuration", c.Gateway)
 	}
 	return nil
+}
+
+// Contains checks whether the ipamSubnet contains [addr].
+func (c *IpamConf) Contains(addr net.IP) bool {
+	if c == nil {
+		return false
+	}
+	if c.PreferredPool == "" {
+		return false
+	}
+
+	_, allowedRange, _ := net.ParseCIDR(c.PreferredPool)
+	if c.SubPool != "" {
+		_, allowedRange, _ = net.ParseCIDR(c.SubPool)
+	}
+
+	return allowedRange.Contains(addr)
+}
+
+// IsStatic checks whether the subnet was statically allocated (ie. user-defined).
+func (c *IpamConf) IsStatic() bool {
+	return c != nil && c.PreferredPool != ""
 }
 
 // IpamInfo contains all the ipam related operational info for a network
@@ -199,7 +164,9 @@ func (i *IpamInfo) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type network struct {
+// Network represents a logical connectivity zone that containers may
+// join using the Link method. A network is managed by a specific driver.
+type Network struct {
 	ctrlr            *Controller
 	name             string
 	networkType      string
@@ -207,7 +174,7 @@ type network struct {
 	created          time.Time
 	scope            string // network data scope
 	labels           map[string]string
-	ipamType         string
+	ipamType         string // ipamType is the name of the IPAM driver
 	ipamOptions      map[string]string
 	addrSpace        string
 	ipamV4Config     []*IpamConf
@@ -243,45 +210,48 @@ const (
 	loadBalancerModeDefault = loadBalancerModeNAT
 )
 
-func (n *network) Name() string {
+// Name returns a user chosen name for this network.
+func (n *Network) Name() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.name
 }
 
-func (n *network) ID() string {
+// ID returns a system generated id for this network.
+func (n *Network) ID() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.id
 }
 
-func (n *network) Created() time.Time {
+func (n *Network) Created() time.Time {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.created
 }
 
-func (n *network) Type() string {
+// Type returns the type of network, which corresponds to its managing driver.
+func (n *Network) Type() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.networkType
 }
 
-func (n *network) Key() []string {
+func (n *Network) Key() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return []string{datastore.NetworkKeyPrefix, n.id}
 }
 
-func (n *network) KeyPrefix() []string {
+func (n *Network) KeyPrefix() []string {
 	return []string{datastore.NetworkKeyPrefix}
 }
 
-func (n *network) Value() []byte {
+func (n *Network) Value() []byte {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	b, err := json.Marshal(n)
@@ -291,40 +261,40 @@ func (n *network) Value() []byte {
 	return b
 }
 
-func (n *network) SetValue(value []byte) error {
+func (n *Network) SetValue(value []byte) error {
 	return json.Unmarshal(value, n)
 }
 
-func (n *network) Index() uint64 {
+func (n *Network) Index() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.dbIndex
 }
 
-func (n *network) SetIndex(index uint64) {
+func (n *Network) SetIndex(index uint64) {
 	n.mu.Lock()
 	n.dbIndex = index
 	n.dbExists = true
 	n.mu.Unlock()
 }
 
-func (n *network) Exists() bool {
+func (n *Network) Exists() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.dbExists
 }
 
-func (n *network) Skip() bool {
+func (n *Network) Skip() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return !n.persist
 }
 
-func (n *network) New() datastore.KVObject {
+func (n *Network) New() datastore.KVObject {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	return &network{
+	return &Network{
 		ctrlr:   n.ctrlr,
 		drvOnce: &sync.Once{},
 		scope:   n.scope,
@@ -369,7 +339,7 @@ func (i *IpamInfo) CopyTo(dstI *IpamInfo) error {
 	return nil
 }
 
-func (n *network) validateConfiguration() error {
+func (n *Network) validateConfiguration() error {
 	if n.configOnly {
 		// Only supports network specific configurations.
 		// Network operator configurations are not supported.
@@ -417,7 +387,7 @@ func (n *network) validateConfiguration() error {
 }
 
 // applyConfigurationTo applies network specific configurations.
-func (n *network) applyConfigurationTo(to *network) error {
+func (n *Network) applyConfigurationTo(to *Network) error {
 	to.enableIPv6 = n.enableIPv6
 	if len(n.labels) > 0 {
 		to.labels = make(map[string]string, len(n.labels))
@@ -455,11 +425,11 @@ func (n *network) applyConfigurationTo(to *network) error {
 	return nil
 }
 
-func (n *network) CopyTo(o datastore.KVObject) error {
+func (n *Network) CopyTo(o datastore.KVObject) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	dstN := o.(*network)
+	dstN := o.(*Network)
 	dstN.name = n.name
 	dstN.id = n.id
 	dstN.created = n.created
@@ -537,16 +507,16 @@ func (n *network) CopyTo(o datastore.KVObject) error {
 	return nil
 }
 
-func (n *network) DataScope() string {
+func (n *Network) DataScope() string {
 	s := n.Scope()
 	// All swarm scope networks have local datascope
-	if s == datastore.SwarmScope {
-		s = datastore.LocalScope
+	if s == scope.Swarm {
+		s = scope.Local
 	}
 	return s
 }
 
-func (n *network) getEpCnt() *endpointCnt {
+func (n *Network) getEpCnt() *endpointCnt {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -554,7 +524,7 @@ func (n *network) getEpCnt() *endpointCnt {
 }
 
 // TODO : Can be made much more generic with the help of reflection (but has some golang limitations)
-func (n *network) MarshalJSON() ([]byte, error) {
+func (n *Network) MarshalJSON() ([]byte, error) {
 	netMap := make(map[string]interface{})
 	netMap["name"] = n.name
 	netMap["id"] = n.id
@@ -611,7 +581,7 @@ func (n *network) MarshalJSON() ([]byte, error) {
 }
 
 // TODO : Can be made much more generic with the help of reflection (but has some golang limitations)
-func (n *network) UnmarshalJSON(b []byte) (err error) {
+func (n *Network) UnmarshalJSON(b []byte) (err error) {
 	var netMap map[string]interface{}
 	if err := json.Unmarshal(b, &netMap); err != nil {
 		return err
@@ -734,12 +704,12 @@ func (n *network) UnmarshalJSON(b []byte) (err error) {
 // NetworkOption is an option setter function type used to pass various options to
 // NewNetwork method. The various setter functions of type NetworkOption are
 // provided by libnetwork, they look like NetworkOptionXXXX(...)
-type NetworkOption func(n *network)
+type NetworkOption func(n *Network)
 
 // NetworkOptionGeneric function returns an option setter for a Generic option defined
 // in a Dictionary of Key-Value pair
 func NetworkOptionGeneric(generic map[string]interface{}) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		if n.generic == nil {
 			n.generic = make(map[string]interface{})
 		}
@@ -758,21 +728,21 @@ func NetworkOptionGeneric(generic map[string]interface{}) NetworkOption {
 // NetworkOptionIngress returns an option setter to indicate if a network is
 // an ingress network.
 func NetworkOptionIngress(ingress bool) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.ingress = ingress
 	}
 }
 
 // NetworkOptionPersist returns an option setter to set persistence policy for a network
 func NetworkOptionPersist(persist bool) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.persist = persist
 	}
 }
 
 // NetworkOptionEnableIPv6 returns an option setter to explicitly configure IPv6
 func NetworkOptionEnableIPv6(enableIPv6 bool) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		if n.generic == nil {
 			n.generic = make(map[string]interface{})
 		}
@@ -784,7 +754,7 @@ func NetworkOptionEnableIPv6(enableIPv6 bool) NetworkOption {
 // NetworkOptionInternalNetwork returns an option setter to config the network
 // to be internal which disables default gateway service
 func NetworkOptionInternalNetwork() NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		if n.generic == nil {
 			n.generic = make(map[string]interface{})
 		}
@@ -795,7 +765,7 @@ func NetworkOptionInternalNetwork() NetworkOption {
 
 // NetworkOptionAttachable returns an option setter to set attachable for a network
 func NetworkOptionAttachable(attachable bool) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.attachable = attachable
 	}
 }
@@ -803,14 +773,14 @@ func NetworkOptionAttachable(attachable bool) NetworkOption {
 // NetworkOptionScope returns an option setter to overwrite the network's scope.
 // By default the network's scope is set to the network driver's datascope.
 func NetworkOptionScope(scope string) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.scope = scope
 	}
 }
 
 // NetworkOptionIpam function returns an option setter for the ipam configuration for this network
 func NetworkOptionIpam(ipamDriver string, addrSpace string, ipV4 []*IpamConf, ipV6 []*IpamConf, opts map[string]string) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		if ipamDriver != "" {
 			n.ipamType = ipamDriver
 			if ipamDriver == ipamapi.DefaultIPAM {
@@ -826,14 +796,14 @@ func NetworkOptionIpam(ipamDriver string, addrSpace string, ipV4 []*IpamConf, ip
 
 // NetworkOptionLBEndpoint function returns an option setter for the configuration of the load balancer endpoint for this network
 func NetworkOptionLBEndpoint(ip net.IP) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.loadBalancerIP = ip
 	}
 }
 
 // NetworkOptionDriverOpts function returns an option setter for any driver parameter described by a map
 func NetworkOptionDriverOpts(opts map[string]string) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		if n.generic == nil {
 			n.generic = make(map[string]interface{})
 		}
@@ -847,14 +817,14 @@ func NetworkOptionDriverOpts(opts map[string]string) NetworkOption {
 
 // NetworkOptionLabels function returns an option setter for labels specific to a network
 func NetworkOptionLabels(labels map[string]string) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.labels = labels
 	}
 }
 
 // NetworkOptionDynamic function returns an option setter for dynamic option for a network
 func NetworkOptionDynamic() NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.dynamic = true
 	}
 }
@@ -864,7 +834,7 @@ func NetworkOptionDynamic() NetworkOption {
 // to a container as combination of fixed-cidr-v6 + mac-address
 // TODO: Remove this option setter once we support endpoint ipam options
 func NetworkOptionDeferIPv6Alloc(enable bool) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.postIPv6 = enable
 	}
 }
@@ -873,7 +843,7 @@ func NetworkOptionDeferIPv6Alloc(enable bool) NetworkOption {
 // a configuration only network. It serves as a configuration
 // for other networks.
 func NetworkOptionConfigOnly() NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.configOnly = true
 	}
 }
@@ -881,12 +851,12 @@ func NetworkOptionConfigOnly() NetworkOption {
 // NetworkOptionConfigFrom tells controller to pick the
 // network configuration from a configuration only network
 func NetworkOptionConfigFrom(name string) NetworkOption {
-	return func(n *network) {
+	return func(n *Network) {
 		n.configFrom = name
 	}
 }
 
-func (n *network) processOptions(options ...NetworkOption) {
+func (n *Network) processOptions(options ...NetworkOption) {
 	for _, opt := range options {
 		if opt != nil {
 			opt(n)
@@ -899,10 +869,10 @@ type networkDeleteParams struct {
 }
 
 // NetworkDeleteOption is a type for optional parameters to pass to the
-// network.Delete() function.
+// Network.Delete() function.
 type NetworkDeleteOption func(p *networkDeleteParams)
 
-// NetworkDeleteOptionRemoveLB informs a network.Delete() operation that should
+// NetworkDeleteOptionRemoveLB informs a Network.Delete() operation that should
 // remove the load balancer endpoint for this network.  Note that the Delete()
 // method will automatically remove a load balancing endpoint for most networks
 // when the network is otherwise empty.  However, this does not occur for some
@@ -916,11 +886,11 @@ func NetworkDeleteOptionRemoveLB(p *networkDeleteParams) {
 	p.rmLBEndpoint = true
 }
 
-func (n *network) resolveDriver(name string, load bool) (driverapi.Driver, driverapi.Capability, error) {
+func (n *Network) resolveDriver(name string, load bool) (driverapi.Driver, driverapi.Capability, error) {
 	c := n.getController()
 
 	// Check if a driver for the specified network type is available
-	d, cap := c.drvRegistry.Driver(name)
+	d, capabilities := c.drvRegistry.Driver(name)
 	if d == nil {
 		if load {
 			err := c.loadDriver(name)
@@ -928,7 +898,7 @@ func (n *network) resolveDriver(name string, load bool) (driverapi.Driver, drive
 				return nil, driverapi.Capability{}, err
 			}
 
-			d, cap = c.drvRegistry.Driver(name)
+			d, capabilities = c.drvRegistry.Driver(name)
 			if d == nil {
 				return nil, driverapi.Capability{}, fmt.Errorf("could not resolve driver %s in registry", name)
 			}
@@ -938,19 +908,19 @@ func (n *network) resolveDriver(name string, load bool) (driverapi.Driver, drive
 		}
 	}
 
-	return d, cap, nil
+	return d, capabilities, nil
 }
 
-func (n *network) driverIsMultihost() bool {
-	_, cap, err := n.resolveDriver(n.networkType, true)
+func (n *Network) driverIsMultihost() bool {
+	_, capabilities, err := n.resolveDriver(n.networkType, true)
 	if err != nil {
 		return false
 	}
-	return cap.ConnectivityScope == datastore.GlobalScope
+	return capabilities.ConnectivityScope == scope.Global
 }
 
-func (n *network) driver(load bool) (driverapi.Driver, error) {
-	d, cap, err := n.resolveDriver(n.networkType, load)
+func (n *Network) driver(load bool) (driverapi.Driver, error) {
+	d, capabilities, err := n.resolveDriver(n.networkType, load)
 	if err != nil {
 		return nil, err
 	}
@@ -958,18 +928,19 @@ func (n *network) driver(load bool) (driverapi.Driver, error) {
 	n.mu.Lock()
 	// If load is not required, driver, cap and err may all be nil
 	if n.scope == "" {
-		n.scope = cap.DataScope
+		n.scope = capabilities.DataScope
 	}
 	if n.dynamic {
 		// If the network is dynamic, then it is swarm
 		// scoped regardless of the backing driver.
-		n.scope = datastore.SwarmScope
+		n.scope = scope.Swarm
 	}
 	n.mu.Unlock()
 	return d, nil
 }
 
-func (n *network) Delete(options ...NetworkDeleteOption) error {
+// Delete the network.
+func (n *Network) Delete(options ...NetworkDeleteOption) error {
 	var params networkDeleteParams
 	for _, opt := range options {
 		opt(&params)
@@ -985,7 +956,7 @@ func (n *network) Delete(options ...NetworkDeleteOption) error {
 //     remove load balancer and network if endpoint count == 1
 //   - controller.networkCleanup() -- (true, true)
 //     remove the network no matter what
-func (n *network) delete(force bool, rmLBEndpoint bool) error {
+func (n *Network) delete(force bool, rmLBEndpoint bool) error {
 	n.mu.Lock()
 	c := n.ctrlr
 	name := n.name
@@ -1093,7 +1064,7 @@ func (n *network) delete(force bool, rmLBEndpoint bool) error {
 
 removeFromStore:
 	// deleteFromStore performs an atomic delete operation and the
-	// network.epCnt will help prevent any possible
+	// Network.epCnt will help prevent any possible
 	// race between endpoint join and network delete
 	if err = c.deleteFromStore(n.getEpCnt()); err != nil {
 		if !force {
@@ -1109,10 +1080,10 @@ removeFromStore:
 	return nil
 }
 
-func (n *network) deleteNetwork() error {
+func (n *Network) deleteNetwork() error {
 	d, err := n.driver(true)
 	if err != nil {
-		return fmt.Errorf("failed deleting network: %v", err)
+		return fmt.Errorf("failed deleting Network: %v", err)
 	}
 
 	if err := d.DeleteNetwork(n.ID()); err != nil {
@@ -1132,13 +1103,13 @@ func (n *network) deleteNetwork() error {
 	return nil
 }
 
-func (n *network) addEndpoint(ep *Endpoint) error {
+func (n *Network) addEndpoint(ep *Endpoint) error {
 	d, err := n.driver(true)
 	if err != nil {
 		return fmt.Errorf("failed to add endpoint: %v", err)
 	}
 
-	err = d.CreateEndpoint(n.id, ep.id, ep.Interface(), ep.generic)
+	err = d.CreateEndpoint(n.id, ep.id, ep.Iface(), ep.generic)
 	if err != nil {
 		return types.InternalErrorf("failed to create endpoint %s on network %s: %v",
 			ep.Name(), n.Name(), err)
@@ -1147,7 +1118,9 @@ func (n *network) addEndpoint(ep *Endpoint) error {
 	return nil
 }
 
-func (n *network) CreateEndpoint(name string, options ...EndpointOption) (*Endpoint, error) {
+// CreateEndpoint creates a new endpoint to this network symbolically identified by the
+// specified unique name. The options parameter carries driver specific options.
+func (n *Network) CreateEndpoint(name string, options ...EndpointOption) (*Endpoint, error) {
 	var err error
 	if strings.TrimSpace(name) == "" {
 		return nil, ErrInvalidName(name)
@@ -1167,10 +1140,10 @@ func (n *network) CreateEndpoint(name string, options ...EndpointOption) (*Endpo
 	return n.createEndpoint(name, options...)
 }
 
-func (n *network) createEndpoint(name string, options ...EndpointOption) (*Endpoint, error) {
+func (n *Network) createEndpoint(name string, options ...EndpointOption) (*Endpoint, error) {
 	var err error
 
-	ep := &Endpoint{name: name, generic: make(map[string]interface{}), iface: &endpointInterface{}}
+	ep := &Endpoint{name: name, generic: make(map[string]interface{}), iface: &EndpointInterface{}}
 	ep.id = stringid.GenerateRandomID()
 
 	// Initialize ep.network with a possibly stale copy of n. We need this to get network from
@@ -1187,7 +1160,7 @@ func (n *network) createEndpoint(name string, options ...EndpointOption) (*Endpo
 
 	for _, llIPNet := range ep.Iface().LinkLocalAddresses() {
 		if !llIPNet.IP.IsLinkLocalUnicast() {
-			return nil, types.BadRequestErrorf("invalid link local IP address: %v", llIPNet.IP)
+			return nil, types.InvalidParameterErrorf("invalid link local IP address: %v", llIPNet.IP)
 		}
 	}
 
@@ -1265,7 +1238,8 @@ func (n *network) createEndpoint(name string, options ...EndpointOption) (*Endpo
 	return ep, nil
 }
 
-func (n *network) Endpoints() []*Endpoint {
+// Endpoints returns the list of Endpoint(s) in this network.
+func (n *Network) Endpoints() []*Endpoint {
 	endpoints, err := n.getEndpointsFromStore()
 	if err != nil {
 		log.G(context.TODO()).Error(err)
@@ -1273,7 +1247,8 @@ func (n *network) Endpoints() []*Endpoint {
 	return endpoints
 }
 
-func (n *network) WalkEndpoints(walker EndpointWalker) {
+// WalkEndpoints uses the provided function to walk the Endpoints.
+func (n *Network) WalkEndpoints(walker EndpointWalker) {
 	for _, e := range n.Endpoints() {
 		if walker(e) {
 			return
@@ -1281,7 +1256,9 @@ func (n *network) WalkEndpoints(walker EndpointWalker) {
 	}
 }
 
-func (n *network) EndpointByName(name string) (*Endpoint, error) {
+// EndpointByName returns the Endpoint which has the passed name. If not found,
+// the error ErrNoSuchEndpoint is returned.
+func (n *Network) EndpointByName(name string) (*Endpoint, error) {
 	if name == "" {
 		return nil, ErrInvalidName(name)
 	}
@@ -1304,7 +1281,9 @@ func (n *network) EndpointByName(name string) (*Endpoint, error) {
 	return e, nil
 }
 
-func (n *network) EndpointByID(id string) (*Endpoint, error) {
+// EndpointByID returns the Endpoint which has the passed id. If not found,
+// the error ErrNoSuchEndpoint is returned.
+func (n *Network) EndpointByID(id string) (*Endpoint, error) {
 	if id == "" {
 		return nil, ErrInvalidID(id)
 	}
@@ -1317,7 +1296,7 @@ func (n *network) EndpointByID(id string) (*Endpoint, error) {
 	return ep, nil
 }
 
-func (n *network) updateSvcRecord(ep *Endpoint, localEps []*Endpoint, isAdd bool) {
+func (n *Network) updateSvcRecord(ep *Endpoint, localEps []*Endpoint, isAdd bool) {
 	var ipv6 net.IP
 	epName := ep.Name()
 	if iface := ep.Iface(); iface != nil && iface.Address() != nil {
@@ -1393,7 +1372,7 @@ func delNameToIP(svcMap *setmatrix.SetMatrix[svcMapEntry], name, serviceID strin
 	})
 }
 
-func (n *network) addSvcRecords(eID, name, serviceID string, epIP, epIPv6 net.IP, ipMapUpdate bool, method string) {
+func (n *Network) addSvcRecords(eID, name, serviceID string, epIP, epIPv6 net.IP, ipMapUpdate bool, method string) {
 	// Do not add service names for ingress network as this is a
 	// routing only network
 	if n.ingress {
@@ -1425,7 +1404,7 @@ func (n *network) addSvcRecords(eID, name, serviceID string, epIP, epIPv6 net.IP
 	}
 }
 
-func (n *network) deleteSvcRecords(eID, name, serviceID string, epIP net.IP, epIPv6 net.IP, ipMapUpdate bool, method string) {
+func (n *Network) deleteSvcRecords(eID, name, serviceID string, epIP net.IP, epIPv6 net.IP, ipMapUpdate bool, method string) {
 	// Do not delete service names from ingress network as this is a
 	// routing only network
 	if n.ingress {
@@ -1458,7 +1437,7 @@ func (n *network) deleteSvcRecords(eID, name, serviceID string, epIP net.IP, epI
 	}
 }
 
-func (n *network) getSvcRecords(ep *Endpoint) []etchosts.Record {
+func (n *Network) getSvcRecords(ep *Endpoint) []etchosts.Record {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -1503,13 +1482,13 @@ func (n *network) getSvcRecords(ep *Endpoint) []etchosts.Record {
 	return recs
 }
 
-func (n *network) getController() *Controller {
+func (n *Network) getController() *Controller {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.ctrlr
 }
 
-func (n *network) ipamAllocate() error {
+func (n *Network) ipamAllocate() error {
 	if n.hasSpecialDriver() {
 		return nil
 	}
@@ -1544,16 +1523,43 @@ func (n *network) ipamAllocate() error {
 	return err
 }
 
-func (n *network) requestPoolHelper(ipam ipamapi.Ipam, addressSpace, preferredPool, subPool string, options map[string]string, v6 bool) (string, *net.IPNet, map[string]string, error) {
+func (n *Network) requestPoolHelper(ipam ipamapi.Ipam, addressSpace, requestedPool, requestedSubPool string, options map[string]string, v6 bool) (poolID string, pool *net.IPNet, meta map[string]string, err error) {
+	var tmpPoolLeases []string
+	defer func() {
+		// Prevent repeated lock/unlock in the loop.
+		nwName := n.Name()
+		// Release all pools we held on to.
+		for _, pID := range tmpPoolLeases {
+			if err := ipam.ReleasePool(pID); err != nil {
+				log.G(context.TODO()).Warnf("Failed to release overlapping pool %s while returning from pool request helper for network %s", pool, nwName)
+			}
+		}
+	}()
+
 	for {
-		poolID, pool, meta, err := ipam.RequestPool(addressSpace, preferredPool, subPool, options, v6)
+		poolID, pool, meta, err = ipam.RequestPool(addressSpace, requestedPool, requestedSubPool, options, v6)
 		if err != nil {
 			return "", nil, nil, err
 		}
 
-		// If the network belongs to global scope or the pool was
-		// explicitly chosen or it is invalid, do not perform the overlap check.
-		if n.Scope() == datastore.GlobalScope || preferredPool != "" || !types.IsIPNetValid(pool) {
+		// If the network pool was explicitly chosen, the network belongs to
+		// global scope, or it is invalid ("0.0.0.0/0"), then we don't perform
+		// check for overlaps.
+		//
+		// FIXME(thaJeztah): why are we ignoring invalid pools here?
+		//
+		// The "invalid" conditions was added in [libnetwork#1095][1], which
+		// moved code to reduce os-specific dependencies in the ipam package,
+		// but also introduced a types.IsIPNetValid() function, which considers
+		// "0.0.0.0/0" invalid, and added it to the conditions below.
+		//
+		// Unfortunately review does not mention this change, so there's no
+		// context why. Possibly this was done to prevent errors further down
+		// the line (when checking for overlaps), but returning an error here
+		// instead would likely have avoided that as well, so we can only guess.
+		//
+		// [1]: https://github.com/moby/libnetwork/commit/5ca79d6b87873264516323a7b76f0af7d0298492#diff-bdcd879439d041827d334846f9aba01de6e3683ed8fdd01e63917dae6df23846
+		if requestedPool != "" || n.Scope() == scope.Global || pool.String() == "0.0.0.0/0" {
 			return poolID, pool, meta, nil
 		}
 
@@ -1562,30 +1568,16 @@ func (n *network) requestPoolHelper(ipam ipamapi.Ipam, addressSpace, preferredPo
 			return poolID, pool, meta, nil
 		}
 
-		// Pool obtained in this iteration is
-		// overlapping. Hold onto the pool and don't release
-		// it yet, because we don't want ipam to give us back
-		// the same pool over again. But make sure we still do
-		// a deferred release when we have either obtained a
-		// non-overlapping pool or ran out of pre-defined
-		// pools.
-		defer func() {
-			if err := ipam.ReleasePool(poolID); err != nil {
-				log.G(context.TODO()).Warnf("Failed to release overlapping pool %s while returning from pool request helper for network %s", pool, n.Name())
-			}
-		}()
-
-		// If this is a preferred pool request and the network
-		// is local scope and there is an overlap, we fail the
-		// network creation right here. The pool will be
-		// released in the defer.
-		if preferredPool != "" {
-			return "", nil, nil, fmt.Errorf("requested subnet %s overlaps in the host", preferredPool)
-		}
+		// Pool obtained in this iteration is overlapping. Hold onto the pool
+		// and don't release it yet, because we don't want IPAM to give us back
+		// the same pool over again. But make sure we still do a deferred release
+		// when we have either obtained a non-overlapping pool or ran out of
+		// pre-defined pools.
+		tmpPoolLeases = append(tmpPoolLeases, poolID)
 	}
 }
 
-func (n *network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
+func (n *Network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 	var (
 		cfgList  *[]*IpamConf
 		infoList *[]*IpamInfo
@@ -1634,7 +1626,7 @@ func (n *network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 
 		if gws, ok := d.Meta[netlabel.Gateway]; ok {
 			if d.Gateway, err = types.ParseCIDR(gws); err != nil {
-				return types.BadRequestErrorf("failed to parse gateway address (%v) returned by ipam driver: %v", gws, err)
+				return types.InvalidParameterErrorf("failed to parse gateway address (%v) returned by ipam driver: %v", gws, err)
 			}
 		}
 
@@ -1657,7 +1649,7 @@ func (n *network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 			d.IPAMData.AuxAddresses = make(map[string]*net.IPNet, len(cfg.AuxAddresses))
 			for k, v := range cfg.AuxAddresses {
 				if ip = net.ParseIP(v); ip == nil {
-					return types.BadRequestErrorf("non parsable secondary ip address (%s:%s) passed for network %s", k, v, n.Name())
+					return types.InvalidParameterErrorf("non parsable secondary ip address (%s:%s) passed for network %s", k, v, n.Name())
 				}
 				if !d.Pool.Contains(ip) {
 					return types.ForbiddenErrorf("auxiliary address: (%s:%s) must belong to the master pool: %s", k, v, d.Pool)
@@ -1673,7 +1665,7 @@ func (n *network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 	return nil
 }
 
-func (n *network) ipamRelease() {
+func (n *Network) ipamRelease() {
 	if n.hasSpecialDriver() {
 		return
 	}
@@ -1686,7 +1678,7 @@ func (n *network) ipamRelease() {
 	n.ipamReleaseVersion(6, ipam)
 }
 
-func (n *network) ipamReleaseVersion(ipVer int, ipam ipamapi.Ipam) {
+func (n *Network) ipamReleaseVersion(ipVer int, ipam ipamapi.Ipam) {
 	var infoList *[]*IpamInfo
 
 	switch ipVer {
@@ -1728,7 +1720,7 @@ func (n *network) ipamReleaseVersion(ipVer int, ipam ipamapi.Ipam) {
 	*infoList = nil
 }
 
-func (n *network) getIPInfo(ipVer int) []*IpamInfo {
+func (n *Network) getIPInfo(ipVer int) []*IpamInfo {
 	var info []*IpamInfo
 	switch ipVer {
 	case 4:
@@ -1745,7 +1737,7 @@ func (n *network) getIPInfo(ipVer int) []*IpamInfo {
 	return l
 }
 
-func (n *network) getIPData(ipVer int) []driverapi.IPAMData {
+func (n *Network) getIPData(ipVer int) []driverapi.IPAMData {
 	var info []*IpamInfo
 	switch ipVer {
 	case 4:
@@ -1764,7 +1756,7 @@ func (n *network) getIPData(ipVer int) []driverapi.IPAMData {
 	return l
 }
 
-func (n *network) deriveAddressSpace() (string, error) {
+func (n *Network) deriveAddressSpace() (string, error) {
 	ipam, _ := n.getController().ipamRegistry.IPAM(n.ipamType)
 	if ipam == nil {
 		return "", types.NotFoundErrorf("failed to get default address space: unknown ipam type %q", n.ipamType)
@@ -1773,30 +1765,30 @@ func (n *network) deriveAddressSpace() (string, error) {
 	if err != nil {
 		return "", types.NotFoundErrorf("failed to get default address space: %v", err)
 	}
-	if n.DataScope() == datastore.GlobalScope {
+	if n.DataScope() == scope.Global {
 		return global, nil
 	}
 	return local, nil
 }
 
-func (n *network) Info() NetworkInfo {
-	return n
-}
-
-func (n *network) Peers() []networkdb.PeerInfo {
+// Peers returns a slice of PeerInfo structures which has the information about the peer
+// nodes participating in the same overlay network. This is currently the per-network
+// gossip cluster. For non-dynamic overlay networks and bridge networks it returns an
+// empty slice
+func (n *Network) Peers() []networkdb.PeerInfo {
 	if !n.Dynamic() {
 		return []networkdb.PeerInfo{}
 	}
 
-	agent := n.getController().getAgent()
-	if agent == nil {
+	a := n.getController().getAgent()
+	if a == nil {
 		return []networkdb.PeerInfo{}
 	}
 
-	return agent.networkDB.Peers(n.ID())
+	return a.networkDB.Peers(n.ID())
 }
 
-func (n *network) DriverOptions() map[string]string {
+func (n *Network) DriverOptions() map[string]string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.generic != nil {
@@ -1807,114 +1799,112 @@ func (n *network) DriverOptions() map[string]string {
 	return map[string]string{}
 }
 
-func (n *network) Scope() string {
+func (n *Network) Scope() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.scope
 }
 
-func (n *network) IpamConfig() (string, map[string]string, []*IpamConf, []*IpamConf) {
+func (n *Network) IpamConfig() (ipamType string, ipamOptions map[string]string, ipamV4Config []*IpamConf, ipamV6Config []*IpamConf) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	v4L := make([]*IpamConf, len(n.ipamV4Config))
-	v6L := make([]*IpamConf, len(n.ipamV6Config))
-
+	ipamV4Config = make([]*IpamConf, len(n.ipamV4Config))
 	for i, c := range n.ipamV4Config {
 		cc := &IpamConf{}
 		if err := c.CopyTo(cc); err != nil {
 			log.G(context.TODO()).WithError(err).Error("Error copying ipam ipv4 config")
 		}
-		v4L[i] = cc
+		ipamV4Config[i] = cc
 	}
 
+	ipamV6Config = make([]*IpamConf, len(n.ipamV6Config))
 	for i, c := range n.ipamV6Config {
 		cc := &IpamConf{}
 		if err := c.CopyTo(cc); err != nil {
 			log.G(context.TODO()).WithError(err).Debug("Error copying ipam ipv6 config")
 		}
-		v6L[i] = cc
+		ipamV6Config[i] = cc
 	}
 
-	return n.ipamType, n.ipamOptions, v4L, v6L
+	return n.ipamType, n.ipamOptions, ipamV4Config, ipamV6Config
 }
 
-func (n *network) IpamInfo() ([]*IpamInfo, []*IpamInfo) {
+func (n *Network) IpamInfo() (ipamV4Info []*IpamInfo, ipamV6Info []*IpamInfo) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	v4Info := make([]*IpamInfo, len(n.ipamV4Info))
-	v6Info := make([]*IpamInfo, len(n.ipamV6Info))
-
+	ipamV4Info = make([]*IpamInfo, len(n.ipamV4Info))
 	for i, info := range n.ipamV4Info {
 		ic := &IpamInfo{}
 		if err := info.CopyTo(ic); err != nil {
-			log.G(context.TODO()).WithError(err).Error("Error copying ipv4 ipam config")
+			log.G(context.TODO()).WithError(err).Error("Error copying IPv4 IPAM config")
 		}
-		v4Info[i] = ic
+		ipamV4Info[i] = ic
 	}
 
+	ipamV6Info = make([]*IpamInfo, len(n.ipamV6Info))
 	for i, info := range n.ipamV6Info {
 		ic := &IpamInfo{}
 		if err := info.CopyTo(ic); err != nil {
-			log.G(context.TODO()).WithError(err).Error("Error copying ipv6 ipam config")
+			log.G(context.TODO()).WithError(err).Error("Error copying IPv6 IPAM config")
 		}
-		v6Info[i] = ic
+		ipamV6Info[i] = ic
 	}
 
-	return v4Info, v6Info
+	return ipamV4Info, ipamV6Info
 }
 
-func (n *network) Internal() bool {
+func (n *Network) Internal() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.internal
 }
 
-func (n *network) Attachable() bool {
+func (n *Network) Attachable() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.attachable
 }
 
-func (n *network) Ingress() bool {
+func (n *Network) Ingress() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.ingress
 }
 
-func (n *network) Dynamic() bool {
+func (n *Network) Dynamic() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.dynamic
 }
 
-func (n *network) IPv6Enabled() bool {
+func (n *Network) IPv6Enabled() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.enableIPv6
 }
 
-func (n *network) ConfigFrom() string {
+func (n *Network) ConfigFrom() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.configFrom
 }
 
-func (n *network) ConfigOnly() bool {
+func (n *Network) ConfigOnly() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	return n.configOnly
 }
 
-func (n *network) Labels() map[string]string {
+func (n *Network) Labels() map[string]string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -1926,7 +1916,7 @@ func (n *network) Labels() map[string]string {
 	return lbls
 }
 
-func (n *network) TableEventRegister(tableName string, objType driverapi.ObjectType) error {
+func (n *Network) TableEventRegister(tableName string, objType driverapi.ObjectType) error {
 	if !driverapi.IsValidType(objType) {
 		return fmt.Errorf("invalid object type %v in registering table, %s", objType, tableName)
 	}
@@ -1941,7 +1931,7 @@ func (n *network) TableEventRegister(tableName string, objType driverapi.ObjectT
 	return nil
 }
 
-func (n *network) UpdateIpamConfig(ipV4Data []driverapi.IPAMData) {
+func (n *Network) UpdateIpamConfig(ipV4Data []driverapi.IPAMData) {
 	ipamV4Config := make([]*IpamConf, len(ipV4Data))
 
 	for i, data := range ipV4Data {
@@ -1956,16 +1946,16 @@ func (n *network) UpdateIpamConfig(ipV4Data []driverapi.IPAMData) {
 	n.ipamV4Config = ipamV4Config
 }
 
-// Special drivers are ones which do not need to perform any network plumbing
-func (n *network) hasSpecialDriver() bool {
+// Special drivers are ones which do not need to perform any Network plumbing
+func (n *Network) hasSpecialDriver() bool {
 	return n.Type() == "host" || n.Type() == "null"
 }
 
-func (n *network) hasLoadBalancerEndpoint() bool {
+func (n *Network) hasLoadBalancerEndpoint() bool {
 	return len(n.loadBalancerIP) != 0
 }
 
-func (n *network) ResolveName(req string, ipType int) ([]net.IP, bool) {
+func (n *Network) ResolveName(req string, ipType int) ([]net.IP, bool) {
 	var ipv6Miss bool
 
 	c := n.getController()
@@ -2009,7 +1999,7 @@ func (n *network) ResolveName(req string, ipType int) ([]net.IP, bool) {
 	return nil, ipv6Miss
 }
 
-func (n *network) HandleQueryResp(name string, ip net.IP) {
+func (n *Network) HandleQueryResp(name string, ip net.IP) {
 	networkID := n.ID()
 	c := n.getController()
 	c.mu.Lock()
@@ -2029,7 +2019,7 @@ func (n *network) HandleQueryResp(name string, ip net.IP) {
 	}
 }
 
-func (n *network) ResolveIP(ip string) string {
+func (n *Network) ResolveIP(ip string) string {
 	networkID := n.ID()
 	c := n.getController()
 	c.mu.Lock()
@@ -2059,7 +2049,7 @@ func (n *network) ResolveIP(ip string) string {
 	return elem.name + "." + nwName
 }
 
-func (n *network) ResolveService(name string) ([]*net.SRV, []net.IP) {
+func (n *Network) ResolveService(name string) ([]*net.SRV, []net.IP) {
 	c := n.getController()
 
 	srv := []*net.SRV{}
@@ -2114,36 +2104,33 @@ func (n *network) ResolveService(name string) ([]*net.SRV, []net.IP) {
 	return srv, ip
 }
 
-func (n *network) ExecFunc(f func()) error {
+func (n *Network) ExecFunc(f func()) error {
 	return types.NotImplementedErrorf("ExecFunc not supported by network")
 }
 
-func (n *network) NdotsSet() bool {
+func (n *Network) NdotsSet() bool {
 	return false
 }
 
 // config-only network is looked up by name
-func (c *Controller) getConfigNetwork(name string) (*network, error) {
-	var n Network
-
-	s := func(current Network) bool {
-		if current.Info().ConfigOnly() && current.Name() == name {
+func (c *Controller) getConfigNetwork(name string) (*Network, error) {
+	var n *Network
+	c.WalkNetworks(func(current *Network) bool {
+		if current.ConfigOnly() && current.Name() == name {
 			n = current
 			return true
 		}
 		return false
-	}
-
-	c.WalkNetworks(s)
+	})
 
 	if n == nil {
 		return nil, types.NotFoundErrorf("configuration network %q not found", name)
 	}
 
-	return n.(*network), nil
+	return n, nil
 }
 
-func (n *network) lbSandboxName() string {
+func (n *Network) lbSandboxName() string {
 	name := "lb-" + n.name
 	if n.ingress {
 		name = n.name + "-sbox"
@@ -2151,11 +2138,11 @@ func (n *network) lbSandboxName() string {
 	return name
 }
 
-func (n *network) lbEndpointName() string {
+func (n *Network) lbEndpointName() string {
 	return n.name + "-endpoint"
 }
 
-func (n *network) createLoadBalancerSandbox() (retErr error) {
+func (n *Network) createLoadBalancerSandbox() (retErr error) {
 	sandboxName := n.lbSandboxName()
 	// Mark the sandbox to be a load balancer
 	sbOptions := []SandboxOption{OptionLoadBalancer(n.id)}
@@ -2202,7 +2189,7 @@ func (n *network) createLoadBalancerSandbox() (retErr error) {
 	return sb.EnableService()
 }
 
-func (n *network) deleteLoadBalancerSandbox() error {
+func (n *Network) deleteLoadBalancerSandbox() error {
 	n.mu.Lock()
 	c := n.ctrlr
 	name := n.name

@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	testContainer "github.com/docker/docker/integration/internal/container"
+	"github.com/docker/docker/testutil"
 	"github.com/docker/docker/testutil/daemon"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/poll"
@@ -20,6 +21,9 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot start daemon on remote test run")
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	skip.If(t, testEnv.IsRootless, "rootless mode doesn't support live-restore")
+
+	ctx := testutil.StartSpan(baseContext, t)
+
 	type testCase struct {
 		desc       string
 		config     *container.Config
@@ -83,24 +87,25 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 				t.Run(fmt.Sprintf("live-restore=%v/%s/%s", liveRestoreEnabled, tc.desc, fnName), func(t *testing.T) {
 					t.Parallel()
 
+					ctx := testutil.StartSpan(ctx, t)
+
 					d := daemon.New(t)
-					client := d.NewClientT(t)
+					apiClient := d.NewClientT(t)
 
 					args := []string{"--iptables=false"}
 					if liveRestoreEnabled {
 						args = append(args, "--live-restore")
 					}
 
-					d.StartWithBusybox(t, args...)
+					d.StartWithBusybox(ctx, t, args...)
 					defer d.Stop(t)
-					ctx := context.Background()
 
-					resp, err := client.ContainerCreate(ctx, tc.config, tc.hostConfig, nil, nil, "")
+					resp, err := apiClient.ContainerCreate(ctx, tc.config, tc.hostConfig, nil, nil, "")
 					assert.NilError(t, err)
-					defer client.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true})
+					defer apiClient.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true})
 
 					if tc.xStart {
-						err = client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
+						err = apiClient.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{})
 						assert.NilError(t, err)
 					}
 
@@ -114,7 +119,7 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 
 					var running bool
 					for i := 0; i < 30; i++ {
-						inspect, err := client.ContainerInspect(ctx, resp.ID)
+						inspect, err := apiClient.ContainerInspect(ctx, resp.ID)
 						assert.NilError(t, err)
 
 						running = inspect.State.Running
@@ -129,7 +134,7 @@ func TestDaemonRestartKillContainers(t *testing.T) {
 						startTime := time.Now()
 						ctxPoll, cancel := context.WithTimeout(ctx, 30*time.Second)
 						defer cancel()
-						poll.WaitOn(t, pollForNewHealthCheck(ctxPoll, client, startTime, resp.ID), poll.WithDelay(100*time.Millisecond))
+						poll.WaitOn(t, pollForNewHealthCheck(ctxPoll, apiClient, startTime, resp.ID), poll.WithDelay(100*time.Millisecond))
 					}
 					// TODO(cpuguy83): test pause states... this seems to be rather undefined currently
 				})
@@ -157,9 +162,8 @@ func pollForNewHealthCheck(ctx context.Context, client *client.Client, startTime
 // Container started with --rm should be able to be restarted.
 // It should be removed only if killed or stopped
 func TestContainerWithAutoRemoveCanBeRestarted(t *testing.T) {
-	defer setupTest(t)()
-	cli := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
 	noWaitTimeout := 0
 
@@ -170,42 +174,43 @@ func TestContainerWithAutoRemoveCanBeRestarted(t *testing.T) {
 		{
 			desc: "kill",
 			doSth: func(ctx context.Context, containerID string) error {
-				return cli.ContainerKill(ctx, containerID, "SIGKILL")
+				return apiClient.ContainerKill(ctx, containerID, "SIGKILL")
 			},
 		},
 		{
 			desc: "stop",
 			doSth: func(ctx context.Context, containerID string) error {
-				return cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &noWaitTimeout})
+				return apiClient.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &noWaitTimeout})
 			},
 		},
 	} {
 		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
-			cID := testContainer.Run(ctx, t, cli,
+			testutil.StartSpan(ctx, t)
+			cID := testContainer.Run(ctx, t, apiClient,
 				testContainer.WithName("autoremove-restart-and-"+tc.desc),
 				testContainer.WithAutoRemove,
 			)
 			defer func() {
-				err := cli.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
+				err := apiClient.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
 				if t.Failed() && err != nil {
 					t.Logf("Cleaning up test container failed with error: %v", err)
 				}
 			}()
 
-			err := cli.ContainerRestart(ctx, cID, container.StopOptions{Timeout: &noWaitTimeout})
+			err := apiClient.ContainerRestart(ctx, cID, container.StopOptions{Timeout: &noWaitTimeout})
 			assert.NilError(t, err)
 
-			inspect, err := cli.ContainerInspect(ctx, cID)
+			inspect, err := apiClient.ContainerInspect(ctx, cID)
 			assert.NilError(t, err)
 			assert.Assert(t, inspect.State.Status != "removing", "Container should not be removing yet")
 
-			poll.WaitOn(t, testContainer.IsInState(ctx, cli, cID, "running"))
+			poll.WaitOn(t, testContainer.IsInState(ctx, apiClient, cID, "running"))
 
 			err = tc.doSth(ctx, cID)
 			assert.NilError(t, err)
 
-			poll.WaitOn(t, testContainer.IsRemoved(ctx, cli, cID))
+			poll.WaitOn(t, testContainer.IsRemoved(ctx, apiClient, cID))
 		})
 	}
 }

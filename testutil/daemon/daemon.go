@@ -1,8 +1,10 @@
 package daemon // import "github.com/docker/docker/testutil/daemon"
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,6 +27,7 @@ import (
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/pkg/errors"
 	"gotest.tools/v3/assert"
+	"gotest.tools/v3/poll"
 )
 
 // LogT is the subset of the testing.TB interface used by the daemon.
@@ -274,6 +277,7 @@ func (d *Daemon) NewClientT(t testing.TB, extraOpts ...client.Opt) *client.Clien
 
 	c, err := d.NewClient(extraOpts...)
 	assert.NilError(t, err, "[%s] could not create daemon client", d.id)
+	t.Cleanup(func() { c.Close() })
 	return c
 }
 
@@ -310,6 +314,71 @@ func (d *Daemon) TailLogsT(t LogT, n int) {
 	}
 }
 
+// PollCheckLogs is a poll.Check that checks the daemon logs using the passed in match function.
+func (d *Daemon) PollCheckLogs(ctx context.Context, match func(s string) bool) poll.Check {
+	return func(t poll.LogT) poll.Result {
+		ok, _, err := d.ScanLogs(ctx, match)
+		if err != nil {
+			return poll.Error(err)
+		}
+		if !ok {
+			return poll.Continue("waiting for daemon logs match")
+		}
+		return poll.Success()
+	}
+}
+
+// ScanLogsMatchString returns a function that can be used to scan the daemon logs for the passed in string (`contains`).
+func ScanLogsMatchString(contains string) func(string) bool {
+	return func(line string) bool {
+		return strings.Contains(line, contains)
+	}
+}
+
+// ScanLogsMatchAll returns a function that can be used to scan the daemon logs until *all* the passed in strings are matched
+func ScanLogsMatchAll(contains ...string) func(string) bool {
+	matched := make(map[string]bool)
+	return func(line string) bool {
+		for _, c := range contains {
+			if strings.Contains(line, c) {
+				matched[c] = true
+			}
+		}
+		return len(matched) == len(contains)
+	}
+}
+
+// ScanLogsT uses `ScanLogs` to match the daemon logs using the passed in match function.
+// If there is an error or the match fails, the test will fail.
+func (d *Daemon) ScanLogsT(ctx context.Context, t testing.TB, match func(s string) bool) (bool, string) {
+	t.Helper()
+	ok, line, err := d.ScanLogs(ctx, match)
+	assert.NilError(t, err)
+	return ok, line
+}
+
+// ScanLogs scans the daemon logs and passes each line to the match function.
+func (d *Daemon) ScanLogs(ctx context.Context, match func(s string) bool) (bool, string, error) {
+	stat, err := d.logFile.Stat()
+	if err != nil {
+		return false, "", err
+	}
+	rdr := io.NewSectionReader(d.logFile, 0, stat.Size())
+
+	scanner := bufio.NewScanner(rdr)
+	for scanner.Scan() {
+		if match(scanner.Text()) {
+			return true, scanner.Text(), nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, "", ctx.Err()
+		default:
+		}
+	}
+	return false, "", scanner.Err()
+}
+
 // TailLogs tails N lines from the daemon logs
 func (d *Daemon) TailLogs(n int) ([][]byte, error) {
 	logF, err := os.Open(d.logFile.Name())
@@ -324,7 +393,6 @@ func (d *Daemon) TailLogs(n int) ([][]byte, error) {
 	}
 
 	return lines, nil
-
 }
 
 // Start starts the daemon and return once it is ready to receive requests.
@@ -428,6 +496,7 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 	cmd := exec.Command(dockerdBinary, d.args...)
 	cmd.Env = append(os.Environ(), "DOCKER_SERVICE_PREFER_OFFLINE_IMAGE=1")
 	cmd.Env = append(cmd.Env, d.extraEnv...)
+	cmd.Env = append(cmd.Env, "OTEL_SERVICE_NAME=dockerd-"+d.id)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	d.logFile = out
@@ -513,10 +582,10 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 
 // StartWithBusybox will first start the daemon with Daemon.Start()
 // then save the busybox image from the main daemon and load it into this Daemon instance.
-func (d *Daemon) StartWithBusybox(t testing.TB, arg ...string) {
+func (d *Daemon) StartWithBusybox(ctx context.Context, t testing.TB, arg ...string) {
 	t.Helper()
 	d.Start(t, arg...)
-	d.LoadBusybox(t)
+	d.LoadBusybox(ctx, t)
 }
 
 // Kill will send a SIGKILL to the daemon
@@ -696,7 +765,7 @@ func (d *Daemon) ReloadConfig() error {
 	errCh := make(chan error, 1)
 	started := make(chan struct{})
 	go func() {
-		_, body, err := request.Get("/events", request.Host(d.Sock()))
+		_, body, err := request.Get(context.TODO(), "/events", request.Host(d.Sock()))
 		close(started)
 		if err != nil {
 			errCh <- err
@@ -713,7 +782,7 @@ func (d *Daemon) ReloadConfig() error {
 			if e.Type != events.DaemonEventType {
 				continue
 			}
-			if e.Action != "reload" {
+			if e.Action != events.ActionReload {
 				continue
 			}
 			close(errCh) // notify that we are done
@@ -737,13 +806,12 @@ func (d *Daemon) ReloadConfig() error {
 }
 
 // LoadBusybox image into the daemon
-func (d *Daemon) LoadBusybox(t testing.TB) {
+func (d *Daemon) LoadBusybox(ctx context.Context, t testing.TB) {
 	t.Helper()
 	clientHost, err := client.NewClientWithOpts(client.FromEnv)
 	assert.NilError(t, err, "[%s] failed to create client", d.id)
 	defer clientHost.Close()
 
-	ctx := context.Background()
 	reader, err := clientHost.ImageSave(ctx, []string{"busybox:latest"})
 	assert.NilError(t, err, "[%s] failed to download busybox", d.id)
 	defer reader.Close()
@@ -872,7 +940,7 @@ func (d *Daemon) TamperWithContainerConfig(t testing.TB, containerID string, tam
 	tamper(&c)
 	configBytes, err = json.Marshal(&c)
 	assert.NilError(t, err)
-	assert.NilError(t, os.WriteFile(configPath, configBytes, 0600))
+	assert.NilError(t, os.WriteFile(configPath, configBytes, 0o600))
 }
 
 // cleanupRaftDir removes swarmkit wal files if present

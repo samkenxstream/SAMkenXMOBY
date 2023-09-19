@@ -3,7 +3,6 @@ package container // import "github.com/docker/docker/integration/container"
 import (
 	"archive/tar"
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"os"
@@ -22,23 +21,21 @@ import (
 )
 
 func TestCopyFromContainerPathDoesNotExist(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
-	apiclient := testEnv.APIClient()
-	cid := container.Create(ctx, t, apiclient)
+	apiClient := testEnv.APIClient()
+	cid := container.Create(ctx, t, apiClient)
 
-	_, _, err := apiclient.CopyFromContainer(ctx, cid, "/dne")
+	_, _, err := apiClient.CopyFromContainer(ctx, cid, "/dne")
 	assert.Check(t, is.ErrorType(err, errdefs.IsNotFound))
 	assert.Check(t, is.ErrorContains(err, "Could not find the file /dne in container "+cid))
 }
 
 func TestCopyFromContainerPathIsNotDir(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
-	apiclient := testEnv.APIClient()
-	cid := container.Create(ctx, t, apiclient)
+	apiClient := testEnv.APIClient()
+	cid := container.Create(ctx, t, apiClient)
 
 	path := "/etc/passwd/"
 	expected := "not a directory"
@@ -46,48 +43,46 @@ func TestCopyFromContainerPathIsNotDir(t *testing.T) {
 		path = "c:/windows/system32/drivers/etc/hosts/"
 		expected = "The filename, directory name, or volume label syntax is incorrect."
 	}
-	_, _, err := apiclient.CopyFromContainer(ctx, cid, path)
+	_, _, err := apiClient.CopyFromContainer(ctx, cid, path)
 	assert.Assert(t, is.ErrorContains(err, expected))
 }
 
 func TestCopyToContainerPathDoesNotExist(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
-	apiclient := testEnv.APIClient()
-	cid := container.Create(ctx, t, apiclient)
+	apiClient := testEnv.APIClient()
+	cid := container.Create(ctx, t, apiClient)
 
-	err := apiclient.CopyToContainer(ctx, cid, "/dne", nil, types.CopyToContainerOptions{})
+	err := apiClient.CopyToContainer(ctx, cid, "/dne", nil, types.CopyToContainerOptions{})
 	assert.Check(t, is.ErrorType(err, errdefs.IsNotFound))
 	assert.Check(t, is.ErrorContains(err, "Could not find the file /dne in container "+cid))
 }
 
 func TestCopyEmptyFile(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
-	apiclient := testEnv.APIClient()
-	cid := container.Create(ctx, t, apiclient)
+	apiClient := testEnv.APIClient()
+	cid := container.Create(ctx, t, apiClient)
 
 	// empty content
 	dstDir, _ := makeEmptyArchive(t)
-	err := apiclient.CopyToContainer(ctx, cid, dstDir, bytes.NewReader([]byte("")), types.CopyToContainerOptions{})
+	err := apiClient.CopyToContainer(ctx, cid, dstDir, bytes.NewReader([]byte("")), types.CopyToContainerOptions{})
 	assert.NilError(t, err)
 
 	// tar with empty file
 	dstDir, preparedArchive := makeEmptyArchive(t)
-	err = apiclient.CopyToContainer(ctx, cid, dstDir, preparedArchive, types.CopyToContainerOptions{})
+	err = apiClient.CopyToContainer(ctx, cid, dstDir, preparedArchive, types.CopyToContainerOptions{})
 	assert.NilError(t, err)
 
 	// tar with empty file archive mode
 	dstDir, preparedArchive = makeEmptyArchive(t)
-	err = apiclient.CopyToContainer(ctx, cid, dstDir, preparedArchive, types.CopyToContainerOptions{
+	err = apiClient.CopyToContainer(ctx, cid, dstDir, preparedArchive, types.CopyToContainerOptions{
 		CopyUIDGID: true,
 	})
 	assert.NilError(t, err)
 
 	// copy from empty file
-	rdr, _, err := apiclient.CopyFromContainer(ctx, cid, dstDir)
+	rdr, _, err := apiClient.CopyFromContainer(ctx, cid, dstDir)
 	assert.NilError(t, err)
 	defer rdr.Close()
 }
@@ -120,25 +115,23 @@ func makeEmptyArchive(t *testing.T) (string, io.ReadCloser) {
 }
 
 func TestCopyToContainerPathIsNotDir(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
-	apiclient := testEnv.APIClient()
-	cid := container.Create(ctx, t, apiclient)
+	apiClient := testEnv.APIClient()
+	cid := container.Create(ctx, t, apiClient)
 
 	path := "/etc/passwd/"
 	if testEnv.DaemonInfo.OSType == "windows" {
 		path = "c:/windows/system32/drivers/etc/hosts/"
 	}
-	err := apiclient.CopyToContainer(ctx, cid, path, nil, types.CopyToContainerOptions{})
+	err := apiClient.CopyToContainer(ctx, cid, path, nil, types.CopyToContainerOptions{})
 	assert.Check(t, is.ErrorContains(err, "not a directory"))
 }
 
 func TestCopyFromContainer(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
 	apiClient := testEnv.APIClient()
 
 	dir, err := os.MkdirTemp("", t.Name())

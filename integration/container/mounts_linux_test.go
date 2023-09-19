@@ -1,7 +1,6 @@
 package container // import "github.com/docker/docker/integration/container"
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/pkg/parsers/kernel"
+	"github.com/docker/docker/testutil"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"gotest.tools/v3/assert"
@@ -30,9 +30,7 @@ func TestContainerNetworkMountsNoChown(t *testing.T) {
 	// chown only applies to Linux bind mounted volumes; must be same host to verify
 	skip.If(t, testEnv.IsRemoteDaemon)
 
-	defer setupTest(t)()
-
-	ctx := context.Background()
+	ctx := setupTest(t)
 
 	tmpDir := fs.NewDir(t, "network-file-mounts", fs.WithMode(0o755), fs.WithFile("nwfile", "network file bind mount", fs.WithMode(0o644)))
 	defer tmpDir.Remove()
@@ -91,10 +89,9 @@ func TestContainerNetworkMountsNoChown(t *testing.T) {
 func TestMountDaemonRoot(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 
-	t.Cleanup(setupTest(t))
-	client := testEnv.APIClient()
-	ctx := context.Background()
-	info, err := client.Info(ctx)
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+	info, err := apiClient.Info(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +137,8 @@ func TestMountDaemonRoot(t *testing.T) {
 			test := test
 			t.Parallel()
 
+			ctx := testutil.StartSpan(ctx, t)
+
 			propagationSpec := fmt.Sprintf(":%s", test.propagation)
 			if test.propagation == "" {
 				propagationSpec = ""
@@ -175,7 +174,9 @@ func TestMountDaemonRoot(t *testing.T) {
 					hc := hc
 					t.Parallel()
 
-					c, err := client.ContainerCreate(ctx, &containertypes.Config{
+					ctx := testutil.StartSpan(ctx, t)
+
+					c, err := apiClient.ContainerCreate(ctx, &containertypes.Config{
 						Image: "busybox",
 						Cmd:   []string{"true"},
 					}, hc, nil, nil, "")
@@ -191,12 +192,12 @@ func TestMountDaemonRoot(t *testing.T) {
 					}
 
 					defer func() {
-						if err := client.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{Force: true}); err != nil {
+						if err := apiClient.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{Force: true}); err != nil {
 							panic(err)
 						}
 					}()
 
-					inspect, err := client.ContainerInspect(ctx, c.ID)
+					inspect, err := apiClient.ContainerInspect(ctx, c.ID)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -219,7 +220,7 @@ func TestContainerBindMountNonRecursive(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "BindOptions.NonRecursive requires API v1.40")
 	skip.If(t, testEnv.IsRootless, "cannot be tested because RootlessKit executes the daemon in private mount namespace (https://github.com/rootless-containers/rootlesskit/issues/97)")
 
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
 	tmpDir1 := fs.NewDir(t, "tmpdir1", fs.WithMode(0o755),
 		fs.WithDir("mnt", fs.WithMode(0o755)))
@@ -257,16 +258,15 @@ func TestContainerBindMountNonRecursive(t *testing.T) {
 	}
 	nonRecursiveVerifier := []string{"test", "!", "-f", "/foo/mnt/file"}
 
-	ctx := context.Background()
-	client := testEnv.APIClient()
+	apiClient := testEnv.APIClient()
 	containers := []string{
-		container.Run(ctx, t, client, container.WithMount(implicit), container.WithCmd(recursiveVerifier...)),
-		container.Run(ctx, t, client, container.WithMount(recursive), container.WithCmd(recursiveVerifier...)),
-		container.Run(ctx, t, client, container.WithMount(nonRecursive), container.WithCmd(nonRecursiveVerifier...)),
+		container.Run(ctx, t, apiClient, container.WithMount(implicit), container.WithCmd(recursiveVerifier...)),
+		container.Run(ctx, t, apiClient, container.WithMount(recursive), container.WithCmd(recursiveVerifier...)),
+		container.Run(ctx, t, apiClient, container.WithMount(nonRecursive), container.WithCmd(nonRecursiveVerifier...)),
 	}
 
 	for _, c := range containers {
-		poll.WaitOn(t, container.IsSuccessful(ctx, client, c), poll.WithDelay(100*time.Millisecond))
+		poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, c), poll.WithDelay(100*time.Millisecond))
 	}
 }
 
@@ -277,7 +277,7 @@ func TestContainerVolumesMountedAsShared(t *testing.T) {
 	skip.If(t, testEnv.IsUserNamespace)
 	skip.If(t, testEnv.IsRootless, "cannot be tested because RootlessKit executes the daemon in private mount namespace (https://github.com/rootless-containers/rootlesskit/issues/97)")
 
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
 	// Prepare a source directory to bind mount
 	tmpDir1 := fs.NewDir(t, "volume-source", fs.WithMode(0o755),
@@ -310,10 +310,9 @@ func TestContainerVolumesMountedAsShared(t *testing.T) {
 
 	bindMountCmd := []string{"mount", "--bind", "/volume-dest/mnt1", "/volume-dest/mnt1"}
 
-	ctx := context.Background()
-	client := testEnv.APIClient()
-	containerID := container.Run(ctx, t, client, container.WithPrivileged(true), container.WithMount(sharedMount), container.WithCmd(bindMountCmd...))
-	poll.WaitOn(t, container.IsSuccessful(ctx, client, containerID), poll.WithDelay(100*time.Millisecond))
+	apiClient := testEnv.APIClient()
+	containerID := container.Run(ctx, t, apiClient, container.WithPrivileged(true), container.WithMount(sharedMount), container.WithCmd(bindMountCmd...))
+	poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, containerID), poll.WithDelay(100*time.Millisecond))
 
 	// Make sure a bind mount under a shared volume propagated to host.
 	if mounted, _ := mountinfo.Mounted(tmpDir1Mnt); !mounted {
@@ -329,6 +328,8 @@ func TestContainerVolumesMountedAsSlave(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.IsUserNamespace)
 	skip.If(t, testEnv.IsRootless, "cannot be tested because RootlessKit executes the daemon in private mount namespace (https://github.com/rootless-containers/rootlesskit/issues/97)")
+
+	ctx := testutil.StartSpan(baseContext, t)
 
 	// Prepare a source directory to bind mount
 	tmpDir1 := fs.NewDir(t, "volume-source", fs.WithMode(0o755),
@@ -367,9 +368,8 @@ func TestContainerVolumesMountedAsSlave(t *testing.T) {
 
 	topCmd := []string{"top"}
 
-	ctx := context.Background()
-	client := testEnv.APIClient()
-	containerID := container.Run(ctx, t, client, container.WithTty(true), container.WithMount(slaveMount), container.WithCmd(topCmd...))
+	apiClient := testEnv.APIClient()
+	containerID := container.Run(ctx, t, apiClient, container.WithTty(true), container.WithMount(slaveMount), container.WithCmd(topCmd...))
 
 	// Bind mount tmpDir2/ onto tmpDir1/mnt1. If mount propagates inside
 	// container then contents of tmpDir2/slave-testfile should become
@@ -385,7 +385,7 @@ func TestContainerVolumesMountedAsSlave(t *testing.T) {
 
 	mountCmd := []string{"cat", "/volume-dest/mnt1/slave-testfile"}
 
-	if result, err := container.Exec(ctx, client, containerID, mountCmd); err == nil {
+	if result, err := container.Exec(ctx, apiClient, containerID, mountCmd); err == nil {
 		if result.Stdout() != "Test" {
 			t.Fatalf("Bind mount under slave volume did not propagate to container")
 		}
@@ -396,7 +396,7 @@ func TestContainerVolumesMountedAsSlave(t *testing.T) {
 
 // Regression test for #38995 and #43390.
 func TestContainerCopyLeaksMounts(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
 	bindMount := mounttypes.Mount{
 		Type:   mounttypes.TypeBind,
@@ -407,13 +407,12 @@ func TestContainerCopyLeaksMounts(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
-	client := testEnv.APIClient()
-	cid := container.Run(ctx, t, client, container.WithMount(bindMount), container.WithCmd("sleep", "120s"))
+	apiClient := testEnv.APIClient()
+	cid := container.Run(ctx, t, apiClient, container.WithMount(bindMount), container.WithCmd("sleep", "120s"))
 
 	getMounts := func() string {
 		t.Helper()
-		res, err := container.Exec(ctx, client, cid, []string{"cat", "/proc/self/mountinfo"})
+		res, err := container.Exec(ctx, apiClient, cid, []string{"cat", "/proc/self/mountinfo"})
 		assert.NilError(t, err)
 		assert.Equal(t, res.ExitCode, 0)
 		return res.Stdout()
@@ -421,7 +420,7 @@ func TestContainerCopyLeaksMounts(t *testing.T) {
 
 	mountsBefore := getMounts()
 
-	_, _, err := client.CopyFromContainer(ctx, cid, "/etc/passwd")
+	_, _, err := apiClient.CopyFromContainer(ctx, cid, "/etc/passwd")
 	assert.NilError(t, err)
 
 	mountsAfter := getMounts()
@@ -433,7 +432,7 @@ func TestContainerBindMountRecursivelyReadOnly(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.44"), "requires API v1.44")
 
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
 	// 0o777 for allowing rootless containers to write to this directory
 	tmpDir1 := fs.NewDir(t, "tmpdir1", fs.WithMode(0o777),
@@ -480,7 +479,6 @@ func TestContainerBindMountRecursivelyReadOnly(t *testing.T) {
 		ReadOnlyNonRecursive: true,
 		Propagation:          mounttypes.PropagationRPrivate,
 	}
-	nonRecursiveAsStr := nonRecursive.Source + ":" + nonRecursive.Target + ":ro-non-recursive,rprivate"
 
 	// Force recursive
 	forceRecursive := ro
@@ -488,27 +486,23 @@ func TestContainerBindMountRecursivelyReadOnly(t *testing.T) {
 		ReadOnlyForceRecursive: true,
 		Propagation:            mounttypes.PropagationRPrivate,
 	}
-	forceRecursiveAsStr := forceRecursive.Source + ":" + forceRecursive.Target + ":ro-force-recursive,rprivate"
 
-	ctx := context.Background()
-	client := testEnv.APIClient()
+	apiClient := testEnv.APIClient()
 
 	containers := []string{
-		container.Run(ctx, t, client, container.WithMount(ro), container.WithCmd(roVerifier...)),
-		container.Run(ctx, t, client, container.WithBindRaw(roAsStr), container.WithCmd(roVerifier...)),
+		container.Run(ctx, t, apiClient, container.WithMount(ro), container.WithCmd(roVerifier...)),
+		container.Run(ctx, t, apiClient, container.WithBindRaw(roAsStr), container.WithCmd(roVerifier...)),
 
-		container.Run(ctx, t, client, container.WithMount(nonRecursive), container.WithCmd(nonRecursiveVerifier...)),
-		container.Run(ctx, t, client, container.WithBindRaw(nonRecursiveAsStr), container.WithCmd(nonRecursiveVerifier...)),
+		container.Run(ctx, t, apiClient, container.WithMount(nonRecursive), container.WithCmd(nonRecursiveVerifier...)),
 	}
 
 	if rroSupported {
 		containers = append(containers,
-			container.Run(ctx, t, client, container.WithMount(forceRecursive), container.WithCmd(forceRecursiveVerifier...)),
-			container.Run(ctx, t, client, container.WithBindRaw(forceRecursiveAsStr), container.WithCmd(forceRecursiveVerifier...)),
+			container.Run(ctx, t, apiClient, container.WithMount(forceRecursive), container.WithCmd(forceRecursiveVerifier...)),
 		)
 	}
 
 	for _, c := range containers {
-		poll.WaitOn(t, container.IsSuccessful(ctx, client, c), poll.WithDelay(100*time.Millisecond))
+		poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, c), poll.WithDelay(100*time.Millisecond))
 	}
 }

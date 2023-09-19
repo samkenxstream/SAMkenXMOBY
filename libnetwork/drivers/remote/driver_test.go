@@ -14,9 +14,9 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/discoverapi"
 	"github.com/docker/docker/libnetwork/driverapi"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/docker/docker/pkg/plugins"
 )
@@ -66,7 +66,7 @@ func setupPlugin(t *testing.T, name string, mux *http.ServeMux) func() {
 	}
 
 	mux.HandleFunc("/Plugin.Activate", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.docker.plugins.v1+json")
+		w.Header().Set("Content-Type", plugins.VersionMimetype)
 		fmt.Fprintf(w, `{"Implements": ["%s"]}`, driverapi.NetworkPluginEndpointType)
 	})
 
@@ -93,10 +93,6 @@ type testEndpoint struct {
 	destination           string
 	routeType             int
 	disableGatewayService bool
-}
-
-func (test *testEndpoint) Interface() driverapi.InterfaceInfo {
-	return test
 }
 
 func (test *testEndpoint) Address() *net.IPNet {
@@ -128,7 +124,7 @@ func (test *testEndpoint) SetMacAddress(mac net.HardwareAddr) error {
 		return types.ForbiddenErrorf("endpoint interface MAC address present (%s). Cannot be modified with %s.", test.macAddress, mac)
 	}
 	if mac == nil {
-		return types.BadRequestErrorf("tried to set nil MAC address to endpoint interface")
+		return types.InvalidParameterErrorf("tried to set nil MAC address to endpoint interface")
 	}
 	test.macAddress = mac.String()
 	return nil
@@ -136,7 +132,7 @@ func (test *testEndpoint) SetMacAddress(mac net.HardwareAddr) error {
 
 func (test *testEndpoint) SetIPAddress(address *net.IPNet) error {
 	if address.IP == nil {
-		return types.BadRequestErrorf("tried to set nil IP address to endpoint interface")
+		return types.InvalidParameterErrorf("tried to set nil IP address to endpoint interface")
 	}
 	if address.IP.To4() == nil {
 		return setAddress(&test.addressIPv6, address)
@@ -239,7 +235,7 @@ func TestGetEmptyCapabilities(t *testing.T) {
 		t.Fatal("Driver type does not match that given")
 	}
 
-	_, err = d.(*driver).getCapabilities()
+	_, err = d.getCapabilities()
 	if err == nil {
 		t.Fatal("There should be error reported when get empty capability")
 	}
@@ -273,13 +269,13 @@ func TestGetExtraCapabilities(t *testing.T) {
 		t.Fatal("Driver type does not match that given")
 	}
 
-	c, err := d.(*driver).getCapabilities()
+	c, err := d.getCapabilities()
 	if err != nil {
 		t.Fatal(err)
-	} else if c.DataScope != datastore.LocalScope {
+	} else if c.DataScope != scope.Local {
 		t.Fatalf("get capability '%s', expecting 'local'", c.DataScope)
-	} else if c.ConnectivityScope != datastore.GlobalScope {
-		t.Fatalf("get capability '%s', expecting %q", c.ConnectivityScope, datastore.GlobalScope)
+	} else if c.ConnectivityScope != scope.Global {
+		t.Fatalf("get capability '%s', expecting %q", c.ConnectivityScope, scope.Global)
 	}
 }
 
@@ -309,7 +305,7 @@ func TestGetInvalidCapabilities(t *testing.T) {
 		t.Fatal("Driver type does not match that given")
 	}
 
-	_, err = d.(*driver).getCapabilities()
+	_, err = d.getCapabilities()
 	if err == nil {
 		t.Fatal("There should be error reported when get invalid capability")
 	}
@@ -427,10 +423,10 @@ func TestRemoteDriver(t *testing.T) {
 		t.Fatal("Driver type does not match that given")
 	}
 
-	c, err := d.(*driver).getCapabilities()
+	c, err := d.getCapabilities()
 	if err != nil {
 		t.Fatal(err)
-	} else if c.DataScope != datastore.GlobalScope {
+	} else if c.DataScope != scope.Global {
 		t.Fatalf("get capability '%s', expecting 'global'", c.DataScope)
 	}
 
@@ -550,7 +546,7 @@ func TestMissingValues(t *testing.T) {
 
 type rollbackEndpoint struct{}
 
-func (r *rollbackEndpoint) Interface() driverapi.InterfaceInfo {
+func (r *rollbackEndpoint) Interface() *rollbackEndpoint {
 	return r
 }
 

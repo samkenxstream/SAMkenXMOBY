@@ -2,12 +2,13 @@ package images // import "github.com/docker/docker/daemon/images"
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"runtime"
 
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/backend"
 	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/registry"
@@ -18,7 +19,6 @@ import (
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/system"
 	registrypkg "github.com/docker/docker/registry"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -200,16 +200,14 @@ Please notify the image author to correct the configuration.`,
 // Every call to GetImageAndReleasableLayer MUST call releasableLayer.Release() to prevent
 // leaking of layers.
 func (i *ImageService) GetImageAndReleasableLayer(ctx context.Context, refOrID string, opts backend.GetImageAndLayerOptions) (builder.Image, builder.ROLayer, error) {
-	if refOrID == "" { // ie FROM scratch
-		os := runtime.GOOS
+	if refOrID == "" { // FROM scratch
 		if runtime.GOOS == "windows" {
-			os = "linux"
+			return nil, nil, fmt.Errorf(`"FROM scratch" is not supported on Windows`)
 		}
 		if opts.Platform != nil {
-			os = opts.Platform.OS
-		}
-		if !system.IsOSSupported(os) {
-			return nil, nil, system.ErrNotSupportedOperatingSystem
+			if err := image.CheckOS(opts.Platform.OS); err != nil {
+				return nil, nil, err
+			}
 		}
 		lyr, err := newROLayerForImage(nil, i.layerStore)
 		return nil, lyr, err
@@ -224,8 +222,8 @@ func (i *ImageService) GetImageAndReleasableLayer(ctx context.Context, refOrID s
 			return nil, nil, err
 		}
 		if img != nil {
-			if !system.IsOSSupported(img.OperatingSystem()) {
-				return nil, nil, system.ErrNotSupportedOperatingSystem
+			if err := image.CheckOS(img.OperatingSystem()); err != nil {
+				return nil, nil, err
 			}
 			lyr, err := newROLayerForImage(img, i.layerStore)
 			return img, lyr, err
@@ -236,8 +234,8 @@ func (i *ImageService) GetImageAndReleasableLayer(ctx context.Context, refOrID s
 	if err != nil {
 		return nil, nil, err
 	}
-	if !system.IsOSSupported(img.OperatingSystem()) {
-		return nil, nil, system.ErrNotSupportedOperatingSystem
+	if err := image.CheckOS(img.OperatingSystem()); err != nil {
+		return nil, nil, err
 	}
 	lyr, err := newROLayerForImage(img, i.layerStore)
 	return img, lyr, err

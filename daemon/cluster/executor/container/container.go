@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/log"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types"
 	enginecontainer "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -20,7 +20,7 @@ import (
 	"github.com/docker/docker/daemon/cluster/convert"
 	executorpkg "github.com/docker/docker/daemon/cluster/executor"
 	clustertypes "github.com/docker/docker/daemon/cluster/provider"
-	"github.com/docker/docker/libnetwork/datastore"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/go-connections/nat"
 	"github.com/docker/go-units"
 	gogotypes "github.com/gogo/protobuf/types"
@@ -503,7 +503,6 @@ func (c *containerConfig) resources() enginecontainer.Resources {
 	return resources
 }
 
-// Docker daemon supports just 1 network during container create.
 func (c *containerConfig) createNetworkingConfig(b executorpkg.Backend) *network.NetworkingConfig {
 	var networks []*api.NetworkAttachment
 	if c.task.Spec.GetContainer() != nil || c.task.Spec.GetAttachment() != nil {
@@ -511,28 +510,10 @@ func (c *containerConfig) createNetworkingConfig(b executorpkg.Backend) *network
 	}
 
 	epConfig := make(map[string]*network.EndpointSettings)
-	if len(networks) > 0 {
-		epConfig[networks[0].Network.Spec.Annotations.Name] = getEndpointConfig(networks[0], b)
-	}
-
-	return &network.NetworkingConfig{EndpointsConfig: epConfig}
-}
-
-// TODO: Merge this function with createNetworkingConfig after daemon supports multiple networks in container create
-func (c *containerConfig) connectNetworkingConfig(b executorpkg.Backend) *network.NetworkingConfig {
-	var networks []*api.NetworkAttachment
-	if c.task.Spec.GetContainer() != nil {
-		networks = c.task.Networks
-	}
-	// First network is used during container create. Other networks are used in "docker network connect"
-	if len(networks) < 2 {
-		return nil
-	}
-
-	epConfig := make(map[string]*network.EndpointSettings)
-	for _, na := range networks[1:] {
+	for _, na := range networks {
 		epConfig[na.Network.Spec.Annotations.Name] = getEndpointConfig(na, b)
 	}
+
 	return &network.NetworkingConfig{EndpointsConfig: epConfig}
 }
 
@@ -639,13 +620,12 @@ func (c *containerConfig) networkCreateRequest(name string) (clustertypes.Networ
 
 	options := types.NetworkCreate{
 		// ID:     na.Network.ID,
-		Labels:         na.Network.Spec.Annotations.Labels,
-		Internal:       na.Network.Spec.Internal,
-		Attachable:     na.Network.Spec.Attachable,
-		Ingress:        convert.IsIngressNetwork(na.Network),
-		EnableIPv6:     na.Network.Spec.Ipv6Enabled,
-		CheckDuplicate: true,
-		Scope:          datastore.SwarmScope,
+		Labels:     na.Network.Spec.Annotations.Labels,
+		Internal:   na.Network.Spec.Internal,
+		Attachable: na.Network.Spec.Attachable,
+		Ingress:    convert.IsIngressNetwork(na.Network),
+		EnableIPv6: na.Network.Spec.Ipv6Enabled,
+		Scope:      scope.Swarm,
 	}
 
 	if na.Network.Spec.GetNetwork() != "" {
@@ -722,7 +702,7 @@ func (c *containerConfig) applyPrivileges(hc *enginecontainer.HostConfig) {
 
 func (c *containerConfig) eventFilter() filters.Args {
 	return filters.NewArgs(
-		filters.Arg("type", events.ContainerEventType),
+		filters.Arg("type", string(events.ContainerEventType)),
 		filters.Arg("name", c.name()),
 		filters.Arg("label", fmt.Sprintf("%v.task.id=%v", systemLabelPrefix, c.task.ID)),
 	)

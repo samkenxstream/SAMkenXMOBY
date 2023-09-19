@@ -9,11 +9,9 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/layer"
-	"github.com/docker/docker/pkg/system"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/go-digest/digestset"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // Store is an interface for creating and accessing images
@@ -75,7 +73,7 @@ func (is *store) restore() error {
 	// if we don't need it. The "f" type alias is here is just for convenience,
 	// and to make the code _slightly_ more DRY. See the discussion on GitHub;
 	// https://github.com/moby/moby/pull/44426#discussion_r1059519071
-	type f = logrus.Fields
+	type f = log.Fields
 	err := is.fs.Walk(func(dgst digest.Digest) error {
 		img, err := is.Get(ID(dgst))
 		if err != nil {
@@ -84,7 +82,7 @@ func (is *store) restore() error {
 		}
 		var l layer.Layer
 		if chainID := img.RootFS.ChainID(); chainID != "" {
-			if !system.IsOSSupported(img.OperatingSystem()) {
+			if err := CheckOS(img.OperatingSystem()); err != nil {
 				log.G(context.TODO()).WithFields(f{"chainID": chainID, "os": img.OperatingSystem()}).Error("not restoring image with unsupported operating system")
 				return nil
 			}
@@ -165,8 +163,8 @@ func (is *store) Create(config []byte) (ID, error) {
 
 	var l layer.Layer
 	if layerID != "" {
-		if !system.IsOSSupported(img.OperatingSystem()) {
-			return "", errdefs.InvalidParameter(system.ErrNotSupportedOperatingSystem)
+		if err := CheckOS(img.OperatingSystem()); err != nil {
+			return "", err
 		}
 		l, err = is.lss.Get(layerID)
 		if err != nil {

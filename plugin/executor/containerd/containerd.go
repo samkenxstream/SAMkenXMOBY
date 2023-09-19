@@ -15,7 +15,6 @@ import (
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // ExitHandler represents an object that is called when the exit event is received from containerd
@@ -54,7 +53,7 @@ type Executor struct {
 }
 
 type c8dPlugin struct {
-	log *logrus.Entry
+	log *log.Entry
 	ctr libcontainerdtypes.Container
 	tsk libcontainerdtypes.Task
 }
@@ -76,13 +75,12 @@ func (p c8dPlugin) deleteTaskAndContainer(ctx context.Context) {
 // Create creates a new container
 func (e *Executor) Create(id string, spec specs.Spec, stdout, stderr io.WriteCloser) error {
 	ctx := context.Background()
-	log := log.G(ctx).WithField("plugin", id)
 	ctr, err := libcontainerd.ReplaceContainer(ctx, e.client, id, &spec, e.shim, e.shimOpts)
 	if err != nil {
 		return errors.Wrap(err, "error creating containerd container for plugin")
 	}
 
-	p := c8dPlugin{log: log, ctr: ctr}
+	p := c8dPlugin{log: log.G(ctx).WithField("plugin", id), ctr: ctr}
 	p.tsk, err = ctr.Start(ctx, "", false, attachStreamsFunc(stdout, stderr))
 	if err != nil {
 		p.deleteTaskAndContainer(ctx)

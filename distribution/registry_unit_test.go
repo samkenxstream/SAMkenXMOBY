@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/containerd/containerd/log"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/registry"
 	registrypkg "github.com/docker/docker/registry"
 )
@@ -43,7 +43,6 @@ func testTokenPassThru(t *testing.T, ts *httptest.Server) {
 	endpoint := registrypkg.APIEndpoint{
 		Mirror:       false,
 		URL:          uri,
-		Version:      2,
 		Official:     false,
 		TrimHostname: false,
 		TLSConfig:    nil,

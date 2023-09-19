@@ -2,7 +2,6 @@ package container // import "github.com/docker/docker/integration/container"
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -17,6 +16,7 @@ import (
 	"github.com/docker/docker/integration/internal/container"
 	net "github.com/docker/docker/integration/internal/network"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/docker/testutil"
 	"github.com/docker/docker/testutil/daemon"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
@@ -37,29 +37,25 @@ func TestNISDomainname(t *testing.T) {
 	//  "write sysctl key kernel.domainname: open /proc/sys/kernel/domainname: permission denied\"": unknown.
 	skip.If(t, testEnv.IsRootless, "rootless mode doesn't support setting Domainname (TODO: https://github.com/moby/moby/issues/40632)")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
 	const (
 		hostname   = "foobar"
 		domainname = "baz.cyphar.com"
 	)
 
-	cID := container.Run(ctx, t, client, func(c *container.TestContainerConfig) {
+	cID := container.Run(ctx, t, apiClient, func(c *container.TestContainerConfig) {
 		c.Config.Hostname = hostname
 		c.Config.Domainname = domainname
 	})
-
-	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
-
-	inspect, err := client.ContainerInspect(ctx, cID)
+	inspect, err := apiClient.ContainerInspect(ctx, cID)
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(hostname, inspect.Config.Hostname))
 	assert.Check(t, is.Equal(domainname, inspect.Config.Domainname))
 
 	// Check hostname.
-	res, err := container.Exec(ctx, client, cID,
+	res, err := container.Exec(ctx, apiClient, cID,
 		[]string{"cat", "/proc/sys/kernel/hostname"})
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(res.Stderr(), 0))
@@ -67,7 +63,7 @@ func TestNISDomainname(t *testing.T) {
 	assert.Check(t, is.Equal(hostname, strings.TrimSpace(res.Stdout())))
 
 	// Check domainname.
-	res, err = container.Exec(ctx, client, cID,
+	res, err = container.Exec(ctx, apiClient, cID,
 		[]string{"cat", "/proc/sys/kernel/domainname"})
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(res.Stderr(), 0))
@@ -78,9 +74,8 @@ func TestNISDomainname(t *testing.T) {
 func TestHostnameDnsResolution(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
 	const (
 		hostname = "foobar"
@@ -88,21 +83,18 @@ func TestHostnameDnsResolution(t *testing.T) {
 
 	// using user defined network as we want to use internal DNS
 	netName := "foobar-net"
-	net.CreateNoError(context.Background(), t, client, netName, net.WithDriver("bridge"))
+	net.CreateNoError(ctx, t, apiClient, netName, net.WithDriver("bridge"))
 
-	cID := container.Run(ctx, t, client, func(c *container.TestContainerConfig) {
+	cID := container.Run(ctx, t, apiClient, func(c *container.TestContainerConfig) {
 		c.Config.Hostname = hostname
 		c.HostConfig.NetworkMode = containertypes.NetworkMode(netName)
 	})
-
-	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
-
-	inspect, err := client.ContainerInspect(ctx, cID)
+	inspect, err := apiClient.ContainerInspect(ctx, cID)
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(hostname, inspect.Config.Hostname))
 
 	// Clear hosts file so ping will use DNS for hostname resolution
-	res, err := container.Exec(ctx, client, cID,
+	res, err := container.Exec(ctx, apiClient, cID,
 		[]string{"sh", "-c", "echo 127.0.0.1 localhost | tee /etc/hosts && ping -c 1 foobar"})
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal("", res.Stderr()))
@@ -113,25 +105,22 @@ func TestUnprivilegedPortsAndPing(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
 	skip.If(t, testEnv.IsRootless, "rootless mode doesn't support setting net.ipv4.ping_group_range and net.ipv4.ip_unprivileged_port_start")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	cID := container.Run(ctx, t, client, func(c *container.TestContainerConfig) {
+	cID := container.Run(ctx, t, apiClient, func(c *container.TestContainerConfig) {
 		c.Config.User = "1000:1000"
 	})
 
-	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
-
 	// Check net.ipv4.ping_group_range.
-	res, err := container.Exec(ctx, client, cID, []string{"cat", "/proc/sys/net/ipv4/ping_group_range"})
+	res, err := container.Exec(ctx, apiClient, cID, []string{"cat", "/proc/sys/net/ipv4/ping_group_range"})
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(res.Stderr(), 0))
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Equal(t, `0	2147483647`, strings.TrimSpace(res.Stdout()))
 
 	// Check net.ipv4.ip_unprivileged_port_start.
-	res, err = container.Exec(ctx, client, cID, []string{"cat", "/proc/sys/net/ipv4/ip_unprivileged_port_start"})
+	res, err = container.Exec(ctx, apiClient, cID, []string{"cat", "/proc/sys/net/ipv4/ip_unprivileged_port_start"})
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(res.Stderr(), 0))
 	assert.Equal(t, 0, res.ExitCode)
@@ -144,9 +133,8 @@ func TestPrivilegedHostDevices(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
 	const (
 		devTest         = "/dev/test"
@@ -167,18 +155,16 @@ func TestPrivilegedHostDevices(t *testing.T) {
 	}
 	defer os.Remove(devRootOnlyTest)
 
-	cID := container.Run(ctx, t, client, container.WithPrivileged(true))
-
-	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
+	cID := container.Run(ctx, t, apiClient, container.WithPrivileged(true))
 
 	// Check test device.
-	res, err := container.Exec(ctx, client, cID, []string{"ls", devTest})
+	res, err := container.Exec(ctx, apiClient, cID, []string{"ls", devTest})
 	assert.NilError(t, err)
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Check(t, is.Equal(strings.TrimSpace(res.Stdout()), devTest))
 
 	// Check root-only test device.
-	res, err = container.Exec(ctx, client, cID, []string{"ls", devRootOnlyTest})
+	res, err = container.Exec(ctx, apiClient, cID, []string{"ls", devRootOnlyTest})
 	assert.NilError(t, err)
 	if testEnv.IsRootless() {
 		assert.Equal(t, 1, res.ExitCode)
@@ -193,20 +179,19 @@ func TestRunConsoleSize(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.42"), "skip test from new feature")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	cID := container.Run(ctx, t, client,
+	cID := container.Run(ctx, t, apiClient,
 		container.WithTty(true),
 		container.WithImage("busybox"),
 		container.WithCmd("stty", "size"),
 		container.WithConsoleSize(57, 123),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, client, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
 
-	out, err := client.ContainerLogs(ctx, cID, types.ContainerLogsOptions{ShowStdout: true})
+	out, err := apiClient.ContainerLogs(ctx, cID, types.ContainerLogsOptions{ShowStdout: true})
 	assert.NilError(t, err)
 	defer out.Close()
 
@@ -220,6 +205,8 @@ func TestRunConsoleSize(t *testing.T) {
 func TestRunWithAlternativeContainerdShim(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
+
+	ctx := testutil.StartSpan(baseContext, t)
 
 	realShimPath, err := exec.LookPath("containerd-shim-runc-v2")
 	assert.Assert(t, err)
@@ -246,21 +233,20 @@ func TestRunWithAlternativeContainerdShim(t *testing.T) {
 		daemon.WithEnvVars("PATH="+shimDir+":"+os.Getenv("PATH")),
 		daemon.WithContainerdSocket(""), // A new containerd instance needs to be started which inherits the PATH env var defined above.
 	)
-	d.StartWithBusybox(t)
+	d.StartWithBusybox(ctx, t)
 	defer d.Stop(t)
 
-	client := d.NewClientT(t)
-	ctx := context.Background()
+	apiClient := d.NewClientT(t)
 
-	cID := container.Run(ctx, t, client,
+	cID := container.Run(ctx, t, apiClient,
 		container.WithImage("busybox"),
 		container.WithCmd("sh", "-c", `echo 'Hello, world!'`),
 		container.WithRuntime("io.containerd.realfake.v42"),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, client, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
 
-	out, err := client.ContainerLogs(ctx, cID, types.ContainerLogsOptions{ShowStdout: true})
+	out, err := apiClient.ContainerLogs(ctx, cID, types.ContainerLogsOptions{ShowStdout: true})
 	assert.NilError(t, err)
 	defer out.Close()
 
@@ -273,14 +259,14 @@ func TestRunWithAlternativeContainerdShim(t *testing.T) {
 	d.Stop(t)
 	d.Start(t, "--default-runtime="+"io.containerd.realfake.v42")
 
-	cID = container.Run(ctx, t, client,
+	cID = container.Run(ctx, t, apiClient,
 		container.WithImage("busybox"),
 		container.WithCmd("sh", "-c", `echo 'Hello, world!'`),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, client, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
 
-	out, err = client.ContainerLogs(ctx, cID, types.ContainerLogsOptions{ShowStdout: true})
+	out, err = apiClient.ContainerLogs(ctx, cID, types.ContainerLogsOptions{ShowStdout: true})
 	assert.NilError(t, err)
 	defer out.Close()
 
@@ -289,4 +275,30 @@ func TestRunWithAlternativeContainerdShim(t *testing.T) {
 	assert.NilError(t, err)
 
 	assert.Equal(t, strings.TrimSpace(b.String()), "Hello, world!")
+}
+
+func TestMacAddressIsAppliedToMainNetworkWithShortID(t *testing.T) {
+	skip.If(t, testEnv.IsRemoteDaemon)
+	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
+
+	ctx := testutil.StartSpan(baseContext, t)
+
+	d := daemon.New(t)
+	d.StartWithBusybox(ctx, t)
+	defer d.Stop(t)
+
+	apiClient := d.NewClientT(t)
+
+	n := net.CreateNoError(ctx, t, apiClient, "testnet", net.WithIPAM("192.168.101.0/24", "192.168.101.1"))
+
+	cid := container.Run(ctx, t, apiClient,
+		container.WithImage("busybox:latest"),
+		container.WithCmd("/bin/sleep", "infinity"),
+		container.WithStopSignal("SIGKILL"),
+		container.WithNetworkMode(n[:10]),
+		container.WithMacAddress("02:42:08:26:a9:55"))
+	defer container.Remove(ctx, t, apiClient, cid, types.ContainerRemoveOptions{Force: true})
+
+	c := container.Inspect(ctx, t, apiClient, cid)
+	assert.Equal(t, c.NetworkSettings.Networks["testnet"].MacAddress, "02:42:08:26:a9:55")
 }

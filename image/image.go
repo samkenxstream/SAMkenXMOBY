@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/layer"
@@ -257,6 +257,15 @@ func NewChildImage(img *Image, child ChildConfig, os string) *Image {
 		OSFeatures: img.OSFeatures,
 		OSVersion:  img.OSVersion,
 	}
+}
+
+// Clone clones an image and changes ID.
+func Clone(base *Image, id ID) *Image {
+	img := *base
+	img.RootFS = img.RootFS.Clone()
+	img.V1Image.ID = id.String()
+	img.computedID = id
+	return &img
 }
 
 // History stores build commands that were used to create an image

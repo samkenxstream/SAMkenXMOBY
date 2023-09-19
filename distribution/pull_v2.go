@@ -12,12 +12,12 @@ import (
 
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
+	"github.com/distribution/reference"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/manifestlist"
 	"github.com/docker/distribution/manifest/ocischema"
 	"github.com/docker/distribution/manifest/schema1"
 	"github.com/docker/distribution/manifest/schema2"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/client/transport"
 	"github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
@@ -27,13 +27,11 @@ import (
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/system"
 	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	archvariant "github.com/tonistiigi/go-archvariant"
 )
 
@@ -375,11 +373,10 @@ func (p *puller) pullTag(ctx context.Context, ref reference.Named, platform *oci
 		return false, fmt.Errorf("internal error: reference has neither a tag nor a digest: %s", reference.FamiliarString(ref))
 	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(
-		logrus.Fields{
-			"digest": dgst,
-			"remote": ref,
-		}))
+	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
+		"digest": dgst,
+		"remote": ref,
+	}))
 
 	desc := ocispec.Descriptor{
 		MediaType: mt,
@@ -438,13 +435,9 @@ func (p *puller) pullTag(ctx context.Context, ref reference.Named, platform *oci
 
 	switch v := manifest.(type) {
 	case *schema1.SignedManifest:
-		// give registries time to upgrade to schema2 and only warn if we know a registry has been upgraded long time ago
-		// TODO: condition to be removed
-		if reference.Domain(ref) == "docker.io" {
-			msg := fmt.Sprintf("Image %s uses outdated schema1 manifest format. Please upgrade to a schema2 image for better future compatibility. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", ref)
-			log.G(ctx).Warn(msg)
-			progress.Message(p.config.ProgressOutput, "", msg)
-		}
+		msg := fmt.Sprintf("[DEPRECATION NOTICE] Docker Image Format v1, and Docker Image manifest version 2, schema 1 support will be removed in an upcoming release. Suggest the author of %s to upgrade the image to the OCI Format, or Docker Image manifest v2, schema 2. More information at https://docs.docker.com/go/deprecated-image-specs/", ref)
+		log.G(ctx).Warn(msg)
+		progress.Message(p.config.ProgressOutput, "", msg)
 
 		id, manifestDigest, err = p.pullSchema1(ctx, ref, v, platform)
 		if err != nil {
@@ -523,7 +516,7 @@ func (p *puller) pullSchema1(ctx context.Context, ref reference.Reference, unver
 	if platform != nil {
 		// Early bath if the requested OS doesn't match that of the configuration.
 		// This avoids doing the download, only to potentially fail later.
-		if !system.IsOSSupported(platform.OS) {
+		if err := image.CheckOS(platform.OS); err != nil {
 			return "", "", fmt.Errorf("cannot download image with operating system %q when requesting %q", runtime.GOOS, platform.OS)
 		}
 	}
@@ -707,7 +700,7 @@ func (p *puller) pullSchema2Layers(ctx context.Context, target distribution.Desc
 		if platform == nil {
 			// Early bath if the requested OS doesn't match that of the configuration.
 			// This avoids doing the download, only to potentially fail later.
-			if !system.IsOSSupported(configPlatform.OS) {
+			if err := image.CheckOS(configPlatform.OS); err != nil {
 				return "", fmt.Errorf("cannot download image with operating system %q when requesting %q", configPlatform.OS, layerStoreOS)
 			}
 			layerStoreOS = configPlatform.OS
@@ -722,8 +715,10 @@ func (p *puller) pullSchema2Layers(ctx context.Context, target distribution.Desc
 
 	// Assume that the operating system is the host OS if blank, and validate it
 	// to ensure we don't cause a panic by an invalid index into the layerstores.
-	if layerStoreOS != "" && !system.IsOSSupported(layerStoreOS) {
-		return "", system.ErrNotSupportedOperatingSystem
+	if layerStoreOS != "" {
+		if err := image.CheckOS(layerStoreOS); err != nil {
+			return "", err
+		}
 	}
 
 	if p.config.DownloadManager != nil {
@@ -873,7 +868,7 @@ func (p *puller) pullManifestList(ctx context.Context, ref reference.Named, mfst
 
 		switch v := manifest.(type) {
 		case *schema1.SignedManifest:
-			msg := fmt.Sprintf("[DEPRECATION NOTICE] v2 schema1 manifests in manifest lists are not supported and will break in a future release. Suggest author of %s to upgrade to v2 schema2. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", ref)
+			msg := fmt.Sprintf("[DEPRECATION NOTICE] Docker Image Format v1, and Docker Image manifest version 2, schema 1 support will be removed in an upcoming release. Suggest the author of %s to upgrade the image to the OCI Format, or Docker Image manifest v2, schema 2. More information at https://docs.docker.com/go/deprecated-image-specs/", ref)
 			log.G(ctx).Warn(msg)
 			progress.Message(p.config.ProgressOutput, "", msg)
 

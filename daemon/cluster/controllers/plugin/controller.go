@@ -6,7 +6,7 @@ import (
 	"net/http"
 
 	"github.com/containerd/containerd/log"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/swarm/runtime"
@@ -16,7 +16,6 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/moby/swarmkit/v2/api"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // Controller is the controller for the plugin backend.
@@ -31,7 +30,7 @@ import (
 type Controller struct {
 	backend Backend
 	spec    runtime.PluginSpec
-	logger  *logrus.Entry
+	logger  *log.Entry
 
 	pluginID  string
 	serviceID string
@@ -62,7 +61,7 @@ func NewController(backend Backend, t *api.Task) (*Controller, error) {
 		backend:   backend,
 		spec:      spec,
 		serviceID: t.ServiceID,
-		logger: log.G(context.TODO()).WithFields(logrus.Fields{
+		logger: log.G(context.TODO()).WithFields(log.Fields{
 			"controller": "plugin",
 			"task":       t.ID,
 			"plugin":     spec.Name,

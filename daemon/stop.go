@@ -6,6 +6,7 @@ import (
 
 	"github.com/containerd/containerd/log"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/moby/sys/signal"
@@ -26,7 +27,12 @@ func (daemon *Daemon) ContainerStop(ctx context.Context, name string, options co
 		return err
 	}
 	if !ctr.IsRunning() {
-		return containerNotModifiedError{}
+		// This is not an actual error, but produces a 304 "not modified"
+		// when returned through the API to indicates the container is
+		// already in the desired state. It's implemented as an error
+		// to make the code calling this function terminate early (as
+		// no further processing is needed).
+		return errdefs.NotModified(errors.New("container is already stopped"))
 	}
 	err = daemon.containerStop(ctx, ctr, options)
 	if err != nil {
@@ -68,7 +74,7 @@ func (daemon *Daemon) containerStop(_ context.Context, ctr *container.Container,
 	}
 	defer func() {
 		if retErr == nil {
-			daemon.LogContainerEvent(ctr, "stop")
+			daemon.LogContainerEvent(ctr, events.ActionStop)
 		}
 	}()
 

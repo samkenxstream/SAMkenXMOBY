@@ -5,20 +5,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"time"
 
-	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
 	cerrdefs "github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/platforms"
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/builder/dockerfile"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
+	imagespec "github.com/docker/docker/image/spec/specs-go/v1"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/google/uuid"
@@ -26,7 +28,6 @@ import (
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // ImportImage imports an image, getting the archived layer data from layerReader.
@@ -47,7 +48,11 @@ func (i *ImageService) ImportImage(ctx context.Context, ref reference.Named, pla
 	if err != nil {
 		return "", errdefs.System(err)
 	}
-	defer release(ctx)
+	defer func() {
+		if err := release(ctx); err != nil {
+			logger.WithError(err).Warn("failed to release lease created for import")
+		}
+	}()
 
 	if platform == nil {
 		def := platforms.DefaultSpec()
@@ -67,7 +72,7 @@ func (i *ImageService) ImportImage(ctx context.Context, ref reference.Named, pla
 		logger.WithError(err).Debug("failed to write layer blob")
 		return "", err
 	}
-	logger = logger.WithFields(logrus.Fields{
+	logger = logger.WithFields(log.Fields{
 		"compressedDigest":   compressedDigest,
 		"uncompressedDigest": uncompressedDigest,
 	})
@@ -84,26 +89,28 @@ func (i *ImageService) ImportImage(ctx context.Context, ref reference.Named, pla
 		Size:      size,
 	}
 
-	ociCfg := containerConfigToOciImageConfig(imageConfig)
+	dockerCfg := containerConfigToDockerOCIImageConfig(imageConfig)
 	createdAt := time.Now()
-	config := ocispec.Image{
-		Platform: *platform,
-		Created:  &createdAt,
-		Author:   "",
-		Config:   ociCfg,
-		RootFS: ocispec.RootFS{
-			Type:    "layers",
-			DiffIDs: []digest.Digest{uncompressedDigest},
-		},
-		History: []ocispec.History{
-			{
-				Created:    &createdAt,
-				CreatedBy:  "",
-				Author:     "",
-				Comment:    msg,
-				EmptyLayer: false,
+	config := imagespec.DockerOCIImage{
+		Image: ocispec.Image{
+			Platform: *platform,
+			Created:  &createdAt,
+			Author:   "",
+			RootFS: ocispec.RootFS{
+				Type:    "layers",
+				DiffIDs: []digest.Digest{uncompressedDigest},
+			},
+			History: []ocispec.History{
+				{
+					Created:    &createdAt,
+					CreatedBy:  "",
+					Author:     "",
+					Comment:    msg,
+					EmptyLayer: false,
+				},
 			},
 		},
+		Config: dockerCfg,
 	}
 	configDesc, err := storeJson(ctx, cs, ocispec.MediaTypeImageConfig, config, nil)
 	if err != nil {
@@ -143,11 +150,12 @@ func (i *ImageService) ImportImage(ctx context.Context, ref reference.Named, pla
 		logger.WithError(err).Debug("failed to save image")
 		return "", err
 	}
-	err = i.unpackImage(ctx, img, *platform)
+
+	err = i.unpackImage(ctx, i.StorageDriver(), img, manifestDesc)
 	if err != nil {
 		logger.WithError(err).Debug("failed to unpack image")
 	} else {
-		i.LogImageEvent(id.String(), id.String(), "import")
+		i.LogImageEvent(id.String(), id.String(), events.ActionImport)
 	}
 
 	return id, err
@@ -251,14 +259,13 @@ func compressAndWriteBlob(ctx context.Context, cs content.Store, compression arc
 	if err != nil {
 		return "", "", errdefs.InvalidParameter(err)
 	}
-	defer compressor.Close()
 
 	writeChan := make(chan digest.Digest)
 	// Start copying the blob to the content store from the pipe.
 	go func() {
-		digest, err := writeBlobAndReturnDigest(ctx, cs, mediaType, pr)
+		dgst, err := writeBlobAndReturnDigest(ctx, cs, mediaType, pr)
 		pr.CloseWithError(err)
-		writeChan <- digest
+		writeChan <- dgst
 	}()
 
 	// Copy archive to the pipe and tee it to a digester.
@@ -306,18 +313,20 @@ func (i *ImageService) saveImage(ctx context.Context, img images.Image) error {
 	return nil
 }
 
-// unpackImage unpacks the image into the snapshotter.
-func (i *ImageService) unpackImage(ctx context.Context, img images.Image, platform ocispec.Platform) error {
-	c8dImg := containerd.NewImageWithPlatform(i.client, img, platforms.Only(platform))
-	unpacked, err := c8dImg.IsUnpacked(ctx, i.snapshotter)
+// unpackImage unpacks the platform-specific manifest of a image into the snapshotter.
+func (i *ImageService) unpackImage(ctx context.Context, snapshotter string, img images.Image, manifestDesc ocispec.Descriptor) error {
+	c8dImg, err := i.NewImageManifest(ctx, img, manifestDesc)
 	if err != nil {
 		return err
 	}
-	if !unpacked {
-		err = c8dImg.Unpack(ctx, i.snapshotter)
+
+	if err := c8dImg.Unpack(ctx, snapshotter); err != nil {
+		if !cerrdefs.IsAlreadyExists(err) {
+			return errdefs.System(fmt.Errorf("failed to unpack image: %w", err))
+		}
 	}
 
-	return err
+	return nil
 }
 
 // detectCompression dectects the reader compression type.
@@ -379,26 +388,4 @@ func storeJson(ctx context.Context, cs content.Ingester, mt string, obj interfac
 		return ocispec.Descriptor{}, errdefs.System(err)
 	}
 	return desc, nil
-}
-
-func containerConfigToOciImageConfig(cfg *container.Config) ocispec.ImageConfig {
-	ociCfg := ocispec.ImageConfig{
-		User:        cfg.User,
-		Env:         cfg.Env,
-		Entrypoint:  cfg.Entrypoint,
-		Cmd:         cfg.Cmd,
-		Volumes:     cfg.Volumes,
-		WorkingDir:  cfg.WorkingDir,
-		Labels:      cfg.Labels,
-		StopSignal:  cfg.StopSignal,
-		ArgsEscaped: cfg.ArgsEscaped,
-	}
-	if len(cfg.ExposedPorts) > 0 {
-		ociCfg.ExposedPorts = map[string]struct{}{}
-		for k, v := range cfg.ExposedPorts {
-			ociCfg.ExposedPorts[string(k)] = v
-		}
-	}
-
-	return ociCfg
 }

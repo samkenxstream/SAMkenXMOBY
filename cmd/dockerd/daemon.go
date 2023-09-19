@@ -17,6 +17,7 @@ import (
 	"github.com/container-orchestrated-devices/container-device-interface/pkg/cdi"
 	containerddefaults "github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/tracing"
 	"github.com/docker/docker/api"
 	apiserver "github.com/docker/docker/api/server"
 	buildbackend "github.com/docker/docker/api/server/backend/build"
@@ -47,7 +48,6 @@ import (
 	dopts "github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/authorization"
 	"github.com/docker/docker/pkg/homedir"
-	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/pidfile"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/rootless"
@@ -57,10 +57,14 @@ import (
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/tracing/detect"
 	swarmapi "github.com/moby/swarmkit/v2/api"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // DaemonCli represents the daemon CLI.
@@ -228,6 +232,24 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	// Notify that the API is active, but before daemon is set up.
 	preNotifyReady()
 
+	const otelServiceNameEnv = "OTEL_SERVICE_NAME"
+	if _, ok := os.LookupEnv(otelServiceNameEnv); !ok {
+		os.Setenv(otelServiceNameEnv, filepath.Base(os.Args[0]))
+	}
+
+	setOTLPProtoDefault()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	detect.Recorder = detect.NewTraceRecorder()
+
+	tp, err := detect.TracerProvider()
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to initialize tracing, skipping")
+	} else {
+		otel.SetTracerProvider(tp)
+		log.G(ctx).Logger.AddHook(tracing.NewLogrusHook())
+		bklog.G(ctx).Logger.AddHook(tracing.NewLogrusHook())
+	}
+
 	pluginStore := plugin.NewStore()
 
 	var apiServer apiserver.Server
@@ -252,9 +274,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	// - Support needs to be added to the cdi package for injecting Windows devices: https://github.com/container-orchestrated-devices/container-device-interface/issues/28
 	// - The DeviceRequests API must be extended to non-linux platforms.
 	if runtime.GOOS == "linux" && cli.Config.Experimental {
-		daemon.RegisterCDIDriver(
-			cdi.WithSpecDirs(cli.Config.CDISpecDirs...),
-		)
+		daemon.RegisterCDIDriver(cli.Config.CDISpecDirs...)
 	}
 
 	cli.d = d
@@ -282,6 +302,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	if err != nil {
 		return err
 	}
+
 	routerOptions.cluster = c
 
 	httpServer.Handler = apiServer.CreateMux(routerOptions.Build()...)
@@ -305,9 +326,9 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 			defer apiWG.Done()
 			log.G(ctx).Infof("API listen on %s", ls.Addr())
 			if err := httpServer.Serve(ls); err != http.ErrServerClosed {
-				log.G(ctx).WithFields(logrus.Fields{
-					logrus.ErrorKey: err,
-					"listener":      ls.Addr(),
+				log.G(ctx).WithFields(log.Fields{
+					"error":    err,
+					"listener": ls.Addr(),
 				}).Error("ServeAPI error")
 
 				select {
@@ -333,8 +354,25 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		return errors.Wrap(err, "shutting down due to ServeAPI error")
 	}
 
+	detect.Shutdown(context.Background())
+
 	log.G(ctx).Info("Daemon shutdown complete")
 	return nil
+}
+
+// The buildkit "detect" package uses grpc as the default proto, which is in conformance with the old spec.
+// For a little while now http/protobuf is the default spec, so this function sets the protocol to http/protobuf when the env var is unset
+// so that the detect package will use http/protobuf as a default.
+// TODO: This can be removed after buildkit is updated to use http/protobuf as the default.
+func setOTLPProtoDefault() {
+	const (
+		tracesEnv = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"
+		protoEnv  = "OTEL_EXPORTER_OTLP_PROTOCOL"
+	)
+
+	if os.Getenv(tracesEnv) == "" && os.Getenv(protoEnv) == "" {
+		os.Setenv(tracesEnv, "http/protobuf")
+	}
 }
 
 type routerOptions struct {
@@ -543,6 +581,18 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 	err = validateCPURealtimeOptions(conf)
 	if err != nil {
 		return nil, err
+	}
+
+	if conf.CDISpecDirs == nil {
+		// If the CDISpecDirs is not set at this stage, we set it to the default.
+		conf.CDISpecDirs = append([]string(nil), cdi.DefaultSpecDirs...)
+	} else if len(conf.CDISpecDirs) == 1 && conf.CDISpecDirs[0] == "" {
+		// If CDISpecDirs is set to an empty string, we clear it to ensure that CDI is disabled.
+		conf.CDISpecDirs = nil
+	}
+	if !conf.Experimental {
+		// If experimental mode is not set, we clear the CDISpecDirs to ensure that CDI is disabled.
+		conf.CDISpecDirs = nil
 	}
 
 	return conf, nil
@@ -861,37 +911,35 @@ func systemContainerdRunning(honorXDG bool) (string, bool, error) {
 	return addr, err == nil, nil
 }
 
-// configureDaemonLogs sets the logrus logging level and formatting. It expects
+// configureDaemonLogs sets the logging level and formatting. It expects
 // the passed configuration to already be validated, and ignores invalid options.
 func configureDaemonLogs(conf *config.Config) {
-	if conf.LogLevel != "" {
-		lvl, err := logrus.ParseLevel(conf.LogLevel)
-		if err == nil {
-			logrus.SetLevel(lvl)
-		}
-	} else {
-		logrus.SetLevel(logrus.InfoLevel)
-	}
-	logFormat := conf.LogFormat
-	if logFormat == "" {
-		logFormat = log.TextFormat
-	}
-	var formatter logrus.Formatter
-	switch logFormat {
+	switch log.OutputFormat(conf.LogFormat) {
 	case log.JSONFormat:
-		formatter = &logrus.JSONFormatter{
-			TimestampFormat: jsonmessage.RFC3339NanoFixed,
+		if err := log.SetFormat(log.JSONFormat); err != nil {
+			panic(err.Error())
 		}
-	case log.TextFormat:
-		formatter = &logrus.TextFormatter{
-			TimestampFormat: jsonmessage.RFC3339NanoFixed,
-			DisableColors:   conf.RawLogs,
-			FullTimestamp:   true,
+	case log.TextFormat, "":
+		if err := log.SetFormat(log.TextFormat); err != nil {
+			panic(err.Error())
+		}
+		if conf.RawLogs {
+			// FIXME(thaJeztah): this needs a better solution: containerd doesn't allow disabling colors, and this code is depending on internal knowledge of "log.SetFormat"
+			if l, ok := log.L.Logger.Formatter.(*logrus.TextFormatter); ok {
+				l.DisableColors = true
+			}
 		}
 	default:
-		panic("unsupported log format " + logFormat)
+		panic("unsupported log format " + conf.LogFormat)
 	}
-	logrus.SetFormatter(formatter)
+
+	logLevel := conf.LogLevel
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	if err := log.SetLevel(logLevel); err != nil {
+		log.G(context.TODO()).WithError(err).Warn("configure log level")
+	}
 }
 
 func configureProxyEnv(conf *config.Config) {
@@ -911,7 +959,7 @@ func configureProxyEnv(conf *config.Config) {
 
 func overrideProxyEnv(name, val string) {
 	if oldVal := os.Getenv(name); oldVal != "" && oldVal != val {
-		log.G(context.TODO()).WithFields(logrus.Fields{
+		log.G(context.TODO()).WithFields(log.Fields{
 			"name":      name,
 			"old-value": config.MaskCredentials(oldVal),
 			"new-value": config.MaskCredentials(val),

@@ -18,10 +18,10 @@ import (
 	"github.com/docker/docker/libcontainerd/remote"
 	"github.com/docker/docker/libnetwork"
 	nwconfig "github.com/docker/docker/libnetwork/config"
-	"github.com/docker/docker/libnetwork/datastore"
 	winlibnetwork "github.com/docker/docker/libnetwork/drivers/windows"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/options"
+	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/parsers/operatingsystem"
@@ -249,7 +249,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 
 	// Remove networks not present in HNS
 	for _, v := range daemon.netController.Networks() {
-		hnsid := v.Info().DriverOptions()[winlibnetwork.HNSID]
+		hnsid := v.DriverOptions()[winlibnetwork.HNSID]
 		found := false
 
 		for _, v := range hnsresponse {
@@ -262,9 +262,9 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 		if !found {
 			// non-default nat networks should be re-created if missing from HNS
 			if v.Type() == "nat" && v.Name() != "nat" {
-				_, _, v4Conf, v6Conf := v.Info().IpamConfig()
+				_, _, v4Conf, v6Conf := v.IpamConfig()
 				netOption := map[string]string{}
-				for k, v := range v.Info().DriverOptions() {
+				for k, v := range v.DriverOptions() {
 					if k != winlibnetwork.NetworkName && k != winlibnetwork.HNSID {
 						netOption[k] = v
 					}
@@ -290,7 +290,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 			}
 
 			// global networks should not be deleted by local HNS
-			if v.Info().Scope() != datastore.GlobalScope {
+			if v.Scope() != scope.Global {
 				err = v.Delete()
 				if err != nil {
 					log.G(context.TODO()).Errorf("Error occurred when removing network %v", err)
@@ -307,7 +307,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 	defaultNetworkExists := false
 
 	if network, err := daemon.netController.NetworkByName(runconfig.DefaultDaemonNetworkMode().NetworkName()); err == nil {
-		hnsid := network.Info().DriverOptions()[winlibnetwork.HNSID]
+		hnsid := network.DriverOptions()[winlibnetwork.HNSID]
 		for _, v := range hnsresponse {
 			if hnsid == v.Id {
 				defaultNetworkExists = true
@@ -323,9 +323,9 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 		if networkTypeNorm == "private" || networkTypeNorm == "internal" {
 			continue // workaround for HNS reporting unsupported networks
 		}
-		var n libnetwork.Network
-		s := func(current libnetwork.Network) bool {
-			hnsid := current.Info().DriverOptions()[winlibnetwork.HNSID]
+		var n *libnetwork.Network
+		s := func(current *libnetwork.Network) bool {
+			hnsid := current.DriverOptions()[winlibnetwork.HNSID]
 			if hnsid == v.Id {
 				n = current
 				return true
@@ -341,7 +341,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 			nid = n.ID()
 
 			// global networks should not be deleted by local HNS
-			if n.Info().Scope() == datastore.GlobalScope {
+			if n.Scope() == scope.Global {
 				continue
 			}
 			v.Name = n.Name()
@@ -349,7 +349,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 			// is not yet populated in the libnetwork windows driver
 
 			// restore option if it existed before
-			drvOptions = n.Info().DriverOptions()
+			drvOptions = n.DriverOptions()
 			n.Delete()
 		}
 		netOption := map[string]string{
